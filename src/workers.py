@@ -80,14 +80,16 @@ class DetectionWorker(QtCore.QObject):
         self.imgsz = imgsz
         self.source_path = source_path
 
-    @classmethod
+    @classmethod    
     def _get_model(cls, model_path: str):
-        """Lazy-load model, reload if path changed."""
         if not hasattr(cls, "_model") or cls._model_path != model_path:
             print(f"[DetectionWorker] Loading model: {model_path}")
             cls._model = YOLO(model_path)
             cls._model_path = model_path
+            cls._model_task = getattr(cls._model, "task", "detect")
+            print(f"[DetectionWorker] Model task: {cls._model_task}")
         return cls._model
+
 
     @QtCore.Slot()
     def run(self):

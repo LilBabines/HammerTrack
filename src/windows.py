@@ -14,7 +14,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .utils import (
     OBBOX, PolyClass, cvimg_to_qimage, draw_annotations,
     find_orthogonal_projection, ensure_bgr_u8,
-    FrameSource,VideoSource, ImageFolderSource
+    FrameSource, VideoSource, ImageFolderSource
 )
 from .workers import (
     DetectionWorker, DetectFinetuneWorker, YOLO_MODEL_PATH
@@ -49,12 +49,10 @@ class ProjectManager:
     def create_project(self, name: str) -> str:
         proj_dir = os.path.join(self.root, name)
         os.makedirs(proj_dir, exist_ok=True)
-        # Sub-folders
         for sub in ("datasets/images/train", "datasets/images/val",
                      "datasets/labels/train", "datasets/labels/val",
                      "finetune_runs", "exports"):
             os.makedirs(os.path.join(proj_dir, sub), exist_ok=True)
-        # Default config
         cfg_path = os.path.join(proj_dir, "config.json")
         if not os.path.exists(cfg_path):
             self.save_config(name, self._default_config(name))
@@ -83,6 +81,7 @@ class ProjectManager:
             "finetune_dir": os.path.join(proj, "finetune_runs"),
             "model_path": YOLO_MODEL_PATH,
             "class_names": ["object"],
+            "task_type": "auto",          # "auto", "obb", "detect"
             "epochs": 20,
             "imgsz": 1024,
             "batch": 16,
@@ -99,8 +98,6 @@ class ProjectManager:
             "proximity_thresh": 0.5,
             "appearance_thresh": 0.25,
         }
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +117,7 @@ class _FinetuneSignalBridge(QtCore.QObject):
 class SettingsPage(QtWidgets.QWidget):
     """Project settings editor."""
 
-    config_changed = QtCore.Signal()   # emitted when user saves
+    config_changed = QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -143,10 +140,16 @@ class SettingsPage(QtWidgets.QWidget):
         dataset_dir_row = QtWidgets.QHBoxLayout()
         dataset_dir_row.addWidget(self.dataset_dir_edit, stretch=1)
         dataset_dir_row.addWidget(self.dataset_dir_browse_btn)
-        
 
         self.class_names_edit = QtWidgets.QLineEdit()
         self.class_names_edit.setToolTip("Comma-separated class names, e.g.: cat, dog, bird")
+
+        # Task type selector
+        self.task_type_combo = QtWidgets.QComboBox()
+        self.task_type_combo.addItems(["auto", "obb", "detect"])
+        self.task_type_combo.setToolTip(
+            "auto = detect from model; obb = oriented boxes; detect = axis-aligned boxes"
+        )
 
         self.epochs_spin = QtWidgets.QSpinBox()
         self.epochs_spin.setRange(1, 500)
@@ -166,13 +169,13 @@ class SettingsPage(QtWidgets.QWidget):
         self.conf_spin.setRange(0.01, 0.99)
         self.conf_spin.setSingleStep(0.05)
 
-
         self.finetune_dir_label = QtWidgets.QLineEdit()
         self.finetune_dir_label.setReadOnly(True)
 
         form.addRow("Model weights:", model_row)
         form.addRow("Dataset dir:", dataset_dir_row)
         form.addRow("Class names:", self.class_names_edit)
+        form.addRow("Task type:", self.task_type_combo)
         form.addRow("Epochs:", self.epochs_spin)
         form.addRow("Image size:", self.imgsz_spin)
         form.addRow("Batch size:", self.batch_spin)
@@ -223,7 +226,6 @@ class SettingsPage(QtWidgets.QWidget):
         self.appearance_spin.setRange(0.01, 0.99); self.appearance_spin.setSingleStep(0.05)
         self.appearance_spin.setValue(0.25)
 
-        # ── Add rows ──
         form.addRow("── Tracking ──", QtWidgets.QLabel(""))
         form.addRow("Tracker type:", self.tracker_type_combo)
         form.addRow("ReID weights:", reid_row)
@@ -236,7 +238,6 @@ class SettingsPage(QtWidgets.QWidget):
         form.addRow("Proximity thresh:", self.proximity_spin)
         form.addRow("Appearance thresh:", self.appearance_spin)
 
-
         self.save_btn = QtWidgets.QPushButton("Save settings")
         self.save_btn.setFixedWidth(160)
         self.save_btn.clicked.connect(self._on_save)
@@ -247,15 +248,13 @@ class SettingsPage(QtWidgets.QWidget):
         layout.addWidget(self.save_btn, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
         layout.addStretch(1)
 
-
-
-
     def load_config(self, cfg: dict):
         self._cfg = cfg
         self.model_path_edit.setText(cfg.get("model_path", ""))
         self.dataset_dir_edit.setText(cfg.get("dataset_dir", ""))
         names = cfg.get("class_names", ["object"])
         self.class_names_edit.setText(", ".join(names) if isinstance(names, list) else str(names))
+        self.task_type_combo.setCurrentText(cfg.get("task_type", "auto"))
         self.epochs_spin.setValue(cfg.get("epochs", 20))
         self.imgsz_spin.setValue(cfg.get("imgsz", 1024))
         self.batch_spin.setValue(cfg.get("batch", 16))
@@ -263,7 +262,6 @@ class SettingsPage(QtWidgets.QWidget):
         self.conf_spin.setValue(cfg.get("conf_threshold", 0.5))
         self.finetune_dir_label.setText(cfg.get("finetune_dir", ""))
 
-        # -- tracker --
         self.tracker_type_combo.setCurrentText(cfg.get("tracker_type", "botsort"))
         self.reid_weights_edit.setText(cfg.get("reid_weights", "osnet_x0_25_msmt17.pt"))
         self.with_reid_chk.setChecked(cfg.get("with_reid", True))
@@ -285,6 +283,7 @@ class SettingsPage(QtWidgets.QWidget):
             "model_path": self.model_path_edit.text(),
             "dataset_dir": self.dataset_dir_edit.text(),
             "class_names": names,
+            "task_type": self.task_type_combo.currentText(),
             "epochs": self.epochs_spin.value(),
             "imgsz": self.imgsz_spin.value(),
             "batch": self.batch_spin.value(),
@@ -310,14 +309,14 @@ class SettingsPage(QtWidgets.QWidget):
         )
         if path:
             self.model_path_edit.setText(path)
-    
+
     def _browse_dataset(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select dataset, WARNING it will be modify", "",
         )
         if path:
             self.dataset_dir_edit.setText(path)
-    
+
     def _browse_reid(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select ReID weights", "",
@@ -326,9 +325,9 @@ class SettingsPage(QtWidgets.QWidget):
         if path:
             self.reid_weights_edit.setText(path)
 
-
     def _on_save(self):
         self.config_changed.emit()
+
 
 # ---------------------------------------------------------------------------
 # Inspect Dataset page
@@ -337,15 +336,16 @@ class SettingsPage(QtWidgets.QWidget):
 class InspectDatasetPage(QtWidgets.QWidget):
     """Browse images + labels from the project dataset (train / val).
     On the val split, can overlay model predictions with confidence scores.
+    Supports both OBB (8-coord) and BBOX (cx cy w h) label formats.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._launcher: Optional["LauncherWindow"] = None
-        self._items: List[Dict[str, str]] = []   # [{img_path, lbl_path}, ...]
+        self._items: List[Dict[str, str]] = []
         self._current: int = 0
         self._current_bgr: Optional[np.ndarray] = None
-        self._pred_cache: Dict[int, List[OBBOX]] = {}   # idx → predictions
+        self._pred_cache: Dict[int, List[OBBOX]] = {}
         self._show_preds: bool = False
 
         # ---- Controls bar ----
@@ -420,7 +420,6 @@ class InspectDatasetPage(QtWidgets.QWidget):
     # ---- Data loading ----
 
     def refresh(self):
-        """Reload the current split from the project dataset dir."""
         self._load_split(self.split_combo.currentText())
 
     def _dataset_dir(self) -> str:
@@ -541,13 +540,11 @@ class InspectDatasetPage(QtWidgets.QWidget):
         h, w = img.shape[:2]
         conf_thresh = self.conf_spin.value()
 
-        # Draw ground-truth labels (green)
         gt_boxes = self._parse_label(item["lbl"], w, h)
         for box in gt_boxes:
             pts = box.poly.reshape(-1, 2).astype(int)
             cv2.polylines(img, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
 
-        # Draw predictions (cyan, with confidence) if toggled
         if self._show_preds and self._current in self._pred_cache:
             preds = self._pred_cache[self._current]
             for box in preds:
@@ -555,22 +552,17 @@ class InspectDatasetPage(QtWidgets.QWidget):
                     continue
                 pts = box.poly.reshape(-1, 2).astype(int)
                 cv2.polylines(img, [pts], True, (255, 255, 0), 2, cv2.LINE_AA)
-                # Confidence text
                 x0, y0 = int(pts[0, 0]), int(pts[0, 1])
                 label = f"{box.conf:.2f}"
-                (tw, th), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(img, (x0, y0 - th - base - 4), (x0 + tw + 6, y0), (255, 255, 0), -1)
+                (tw, th_), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(img, (x0, y0 - th_ - base - 4), (x0 + tw + 6, y0), (255, 255, 0), -1)
                 cv2.putText(img, label, (x0 + 3, y0 - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
-        # Draw legend
         self._draw_legend(img, gt_boxes, conf_thresh)
-
-        # Scale to fit canvas
         self._display(img)
 
     def _draw_legend(self, img: np.ndarray, gt_boxes, conf_thresh: float):
-        """Small legend in the top-left corner."""
         lines = [f"GT: {len(gt_boxes)} boxes"]
         if self._show_preds and self._current in self._pred_cache:
             preds = self._pred_cache[self._current]
@@ -579,14 +571,13 @@ class InspectDatasetPage(QtWidgets.QWidget):
 
         y = 20
         for line in lines:
-            (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            cv2.rectangle(img, (8, y - th - 4), (14 + tw, y + 4), (0, 0, 0), -1)
+            (tw, th_), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.rectangle(img, (8, y - th_ - 4), (14 + tw, y + 4), (0, 0, 0), -1)
             cv2.putText(img, line, (10, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-            y += th + 12
+            y += th_ + 12
 
     def _display(self, img_bgr: np.ndarray):
-        """Fit image into the canvas label."""
         qimg = cvimg_to_qimage(img_bgr)
         lbl_w, lbl_h = self.canvas.width(), self.canvas.height()
         pix = QtGui.QPixmap.fromImage(qimg).scaled(
@@ -596,10 +587,13 @@ class InspectDatasetPage(QtWidgets.QWidget):
         )
         self.canvas.setPixmap(pix)
 
-    # ---- Label parsing ----
+    # ---- Label parsing (auto-detect OBB vs BBOX) ----
 
     def _parse_label(self, lbl_path: str, img_w: int, img_h: int) -> List[OBBOX]:
-        """Parse a YOLO-OBB label file and return denormalized OBBOX list."""
+        """Parse a YOLO label file. Auto-detects format:
+        - 9+ tokens → OBB: cls x1 y1 x2 y2 x3 y3 x4 y4 (normalized)
+        - 5 tokens  → BBOX: cls cx cy w h (normalized)
+        """
         if not lbl_path or not os.path.isfile(lbl_path):
             return []
         boxes = []
@@ -607,14 +601,31 @@ class InspectDatasetPage(QtWidgets.QWidget):
             with open(lbl_path, "r") as f:
                 for line in f:
                     parts = line.strip().split()
-                    if len(parts) < 9:
+                    if len(parts) < 5:
                         continue
                     cls_id = int(parts[0])
-                    coords = [float(x) for x in parts[1:9]]
-                    pts = np.array(coords, dtype=np.float32).reshape(4, 2)
-                    pts[:, 0] *= img_w
-                    pts[:, 1] *= img_h
-                    boxes.append(OBBOX(poly=pts, cls_id=cls_id, conf=1.0))
+
+                    if len(parts) >= 9:
+                        # OBB format: cls x1 y1 x2 y2 x3 y3 x4 y4
+                        coords = [float(x) for x in parts[1:9]]
+                        pts = np.array(coords, dtype=np.float32).reshape(4, 2)
+                        pts[:, 0] *= img_w
+                        pts[:, 1] *= img_h
+                        boxes.append(OBBOX(poly=pts, cls_id=cls_id, conf=1.0))
+                    elif len(parts) >= 5:
+                        # BBOX format: cls cx cy w h (normalized)
+                        cx = float(parts[1]) * img_w
+                        cy = float(parts[2]) * img_h
+                        bw = float(parts[3]) * img_w
+                        bh = float(parts[4]) * img_h
+                        x1 = cx - bw / 2
+                        y1 = cy - bh / 2
+                        x2 = cx + bw / 2
+                        y2 = cy + bh / 2
+                        pts = np.array([
+                            [x1, y1], [x2, y1], [x2, y2], [x1, y2]
+                        ], dtype=np.float32)
+                        boxes.append(OBBOX(poly=pts, cls_id=cls_id, conf=1.0))
         except Exception:
             pass
         return boxes
@@ -626,7 +637,6 @@ class InspectDatasetPage(QtWidgets.QWidget):
         self._redraw()
 
     def _run_prediction(self):
-        """Run the detector on the current image and cache predictions."""
         if not self._items or self._current_bgr is None:
             return
         if not self._launcher:
@@ -681,7 +691,7 @@ class InspectDatasetPage(QtWidgets.QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Train page — wraps the finetune action with project-aware settings
+# Train page
 # ---------------------------------------------------------------------------
 
 class TrainPage(QtWidgets.QWidget):
@@ -691,31 +701,26 @@ class TrainPage(QtWidgets.QWidget):
         super().__init__(parent)
         self._launcher: Optional["LauncherWindow"] = None
 
-        # --- Train button ---
         self.train_btn = QtWidgets.QPushButton("Launch Training (Finetune)")
         self.train_btn.setFixedHeight(40)
         self.train_btn.clicked.connect(self._on_train)
 
-        # --- Progress bar ---
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFormat("Idle")
 
-        # --- Epoch metrics table ---
         self.metrics_table = QtWidgets.QTableWidget()
         self.metrics_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.metrics_table.setAlternatingRowColors(True)
         self.metrics_table.verticalHeader().setVisible(False)
         self.metrics_table.setMaximumHeight(600)
 
-        # --- Console log ---
         self.log_text = QtWidgets.QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setFontFamily("Consolas" if os.name == "nt" else "monospace")
 
-        # --- Layout ---
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(16, 16, 16, 16)
         v.setSpacing(10)
@@ -731,7 +736,6 @@ class TrainPage(QtWidgets.QWidget):
 
     def log(self, msg: str):
         self.log_text.append(msg)
-        # Auto-scroll to bottom
         sb = self.log_text.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -741,18 +745,13 @@ class TrainPage(QtWidgets.QWidget):
         self.progress_bar.setFormat(f"{msg}  —  {pct}%")
 
     def update_metrics(self, epoch: int, total_epochs: int, metrics: dict):
-        """Add or update a row in the metrics table for this epoch."""
         if not metrics:
             return
-
-        # Build column list from all metric keys seen so far
         all_keys = ["Epoch"]
-        # Gather existing columns
         for col in range(self.metrics_table.columnCount()):
             header = self.metrics_table.horizontalHeaderItem(col)
             if header and header.text() != "Epoch":
                 all_keys.append(header.text())
-        # Add new keys
         for k in sorted(metrics.keys()):
             if k not in all_keys:
                 all_keys.append(k)
@@ -760,7 +759,6 @@ class TrainPage(QtWidgets.QWidget):
         self.metrics_table.setColumnCount(len(all_keys))
         self.metrics_table.setHorizontalHeaderLabels(all_keys)
 
-        # Find or create the row for this epoch
         row = -1
         for r in range(self.metrics_table.rowCount()):
             item = self.metrics_table.item(r, 0)
@@ -771,7 +769,6 @@ class TrainPage(QtWidgets.QWidget):
             row = self.metrics_table.rowCount()
             self.metrics_table.insertRow(row)
 
-        # Fill in data
         self.metrics_table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(epoch)))
         for k, v in metrics.items():
             if k in all_keys:
@@ -784,7 +781,6 @@ class TrainPage(QtWidgets.QWidget):
         self.metrics_table.scrollToBottom()
 
     def reset_for_new_run(self):
-        """Clear everything for a fresh training run."""
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Starting...")
         self.metrics_table.setRowCount(0)
@@ -797,11 +793,11 @@ class TrainPage(QtWidgets.QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Annotation page (the existing Base / OBB_VideoPlayer)
+# Annotation page
 # ---------------------------------------------------------------------------
 
 class AnnotatePage(QtWidgets.QWidget):
-    """Wraps the annotation canvas + controls as a page widget (not a QMainWindow)."""
+    """Wraps the annotation canvas + controls as a page widget."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -844,9 +840,18 @@ class AnnotatePage(QtWidgets.QWidget):
         self.orig_poly: Optional[np.ndarray] = None
         self.vertex_drag_idx: Optional[int] = None
 
-        self.crop_start_img: Optional[tuple] = None   # (x, y) in image coords
-        self.crop_end_img: Optional[tuple] = None      # (x, y) in image coords
+        self.crop_start_img: Optional[tuple] = None
+        self.crop_end_img: Optional[tuple] = None
         self.crop_selecting = False
+
+        # --- BBOX click-drag state ---
+        self.bbox_start_img: Optional[tuple] = None
+        self.bbox_end_img: Optional[tuple] = None
+        self.bbox_selecting: bool = False
+
+        # --- Task type: "obb" or "detect" (auto-detected from model) ---
+        self._task_type: str = "obb"
+        self._task_type_cfg: str = "auto"   # from project config
 
         # --- Model ---
         self.model_worker = DetectionWorker
@@ -863,8 +868,14 @@ class AnnotatePage(QtWidgets.QWidget):
         self.video_label.installEventFilter(self)
 
         # Buttons
-        self.add_btn = QtWidgets.QPushButton("Add (N)")
+        self.add_btn = QtWidgets.QPushButton("Add OBB (N)")
+        self.add_btn.setToolTip("Add oriented bounding box: 3 clicks")
         self.add_btn.clicked.connect(self.start_add_mode)
+
+        self.add_bbox_btn = QtWidgets.QPushButton("Add BBox (B)")
+        self.add_bbox_btn.setToolTip("Add axis-aligned box: click + drag + release")
+        self.add_bbox_btn.clicked.connect(self.start_add_bbox_mode)
+
         self.edit_btn = QtWidgets.QPushButton("Edit (E)")
         self.edit_btn.clicked.connect(self.toggle_edit_mode)
         self.verify_btn = QtWidgets.QPushButton("Verify (V)")
@@ -899,6 +910,10 @@ class AnnotatePage(QtWidgets.QWidget):
         self.inference_conf_tresh.setSingleStep(0.05)
         self.inference_conf_tresh.setValue(0.5)
         self.inference_conf_tresh.setPrefix("conf=")
+
+        # Task type indicator label
+        self.task_label = QtWidgets.QLabel("task: —")
+        self.task_label.setStyleSheet("color: #888; font-size: 11px;")
 
         self.frame_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.frame_slider.setRange(0, 0)
@@ -943,6 +958,18 @@ class AnnotatePage(QtWidgets.QWidget):
         if self._launcher:
             self._launcher.statusBar().showMessage(msg, 5000)
 
+    # ---- Effective task type ----
+
+    def _effective_task(self) -> str:
+        """Return 'obb' or 'detect' depending on config + auto-detection."""
+        if self._task_type_cfg in ("obb", "detect"):
+            return self._task_type_cfg
+        return self._task_type   # auto-detected
+
+    def _update_task_label(self):
+        t = self._effective_task()
+        self.task_label.setText(f"task: {t}")
+
     # ---- Layout helpers ----
 
     def _build_transport_bar(self) -> QtWidgets.QWidget:
@@ -979,19 +1006,20 @@ class AnnotatePage(QtWidgets.QWidget):
         infer_box = QtWidgets.QGroupBox("Inference")
         infer_l = QtWidgets.QVBoxLayout(infer_box)
 
-        # Run model row: [Run Model] [⬒]
         run_row = QtWidgets.QHBoxLayout()
         run_row.addWidget(self.run_btn)
         run_row.addWidget(self.crop_infer_btn)
         infer_l.addLayout(run_row)
 
         infer_l.addWidget(self.inference_conf_tresh)
+        infer_l.addWidget(self.task_label)
         infer_l.addWidget(self.export_dataset_btn)
 
         # Annotation group
         anno_box = QtWidgets.QGroupBox("Annotation")
         anno_l = QtWidgets.QVBoxLayout(anno_box)
         anno_l.addWidget(self.add_btn)
+        anno_l.addWidget(self.add_bbox_btn)
         anno_l.addWidget(self.edit_btn)
         anno_l.addWidget(self.verify_btn)
         anno_l.addWidget(self.delete_btn)
@@ -1015,6 +1043,8 @@ class AnnotatePage(QtWidgets.QWidget):
         names = cfg.get("class_names", ["object"])
         self.class_names = names if isinstance(names, list) else [names]
         self.inference_conf_tresh.setValue(cfg.get("conf_threshold", 0.5))
+        self._task_type_cfg = cfg.get("task_type", "auto")
+        self._update_task_label()
 
     # ==================== Source I/O ====================
 
@@ -1041,6 +1071,9 @@ class AnnotatePage(QtWidgets.QWidget):
         self.selected_idx = None
         self.mode = "select"
         self.temp_poly_pts.clear()
+        self.bbox_start_img = None
+        self.bbox_end_img = None
+        self.bbox_selecting = False
         self.source = src
         self.total_frames = src.count()
         self.src_path = getattr(src, "path", None)
@@ -1120,6 +1153,7 @@ class AnnotatePage(QtWidgets.QWidget):
             self.class_names, self.selected_idx,
             show_conf=False, show_label=False,
         )
+        # Ghost polygon for OBB add mode
         if self.mode == "add" and self.temp_poly_pts:
             ghost = np.array(self.temp_poly_pts, dtype=np.int32)
             cv2.polylines(annotated, [ghost], isClosed=False,
@@ -1127,14 +1161,21 @@ class AnnotatePage(QtWidgets.QWidget):
             for (gx, gy) in ghost:
                 cv2.circle(annotated, (int(gx), int(gy)), 3,
                            (200, 200, 200), -1, lineType=cv2.LINE_AA)
-                
+
+        # Ghost rectangle for BBOX add mode
+        if self.mode == "add_bbox" and self.bbox_start_img and self.bbox_end_img:
+            sx, sy = self.bbox_start_img
+            ex, ey = self.bbox_end_img
+            x1, y1 = int(min(sx, ex)), int(min(sy, ey))
+            x2, y2 = int(max(sx, ex)), int(max(sy, ey))
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (200, 200, 200), 2, cv2.LINE_AA)
+
         # Draw crop-inference selection rectangle
         if self.mode == "crop_infer" and self.crop_start_img and self.crop_end_img:
             sx, sy = self.crop_start_img
             ex, ey = self.crop_end_img
             x1, y1 = int(min(sx, ex)), int(min(sy, ey))
             x2, y2 = int(max(sx, ex)), int(max(sy, ey))
-            # Semi-transparent overlay outside the selection
             overlay = annotated.copy()
             cv2.rectangle(overlay, (0, 0), (annotated.shape[1], annotated.shape[0]),
                           (0, 0, 0), -1)
@@ -1142,7 +1183,6 @@ class AnnotatePage(QtWidgets.QWidget):
             cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
             annotated = np.where(mask[..., None] == 255, annotated,
                                  cv2.addWeighted(annotated, 0.3, overlay, 0.7, 0))
-            # Selection border
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 200, 255), 2)
 
         self.show_frame(annotated)
@@ -1180,7 +1220,6 @@ class AnnotatePage(QtWidgets.QWidget):
     # ==================== Model inference ====================
 
     def _toggle_crop_infer_mode(self, checked: bool):
-        """Toggle crop-inference selection mode."""
         if checked:
             self.set_mode("crop_infer")
             self.crop_start_img = None
@@ -1195,7 +1234,6 @@ class AnnotatePage(QtWidgets.QWidget):
             self.redraw_current()
 
     def _cancel_crop_infer(self):
-        """Exit crop-inference mode cleanly."""
         self.crop_infer_btn.setChecked(False)
         self.crop_selecting = False
         self.crop_start_img = None
@@ -1204,12 +1242,10 @@ class AnnotatePage(QtWidgets.QWidget):
         self.redraw_current()
 
     def _run_cropped_inference(self, x1: int, y1: int, x2: int, y2: int):
-        """Run the model on a sub-region, then remap boxes back to full image."""
         if self.current_frame_bgr is None:
             return
 
         h_img, w_img = self.current_frame_bgr.shape[:2]
-        # Clamp to image bounds
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w_img, x2), min(h_img, y2)
         if x2 - x1 < 10 or y2 - y1 < 10:
@@ -1232,12 +1268,11 @@ class AnnotatePage(QtWidgets.QWidget):
             conf=conf,
             imgsz=cfg.get("imgsz", 1024),
             model_path=self.model_path,
-            source_path=None,  # force numpy path for the crop
+            source_path=None,
         )
         self._crop_worker.moveToThread(self._crop_thread)
         self._crop_thread.started.connect(self._crop_worker.run)
 
-        # Use a lambda to pass the offset alongside the normal signal
         self._crop_worker.finished.connect(
             lambda idx, names, boxes: self._on_cropped_done(idx, names, boxes, offset)
         )
@@ -1249,14 +1284,12 @@ class AnnotatePage(QtWidgets.QWidget):
         self._crop_thread.start()
 
     def _on_cropped_done(self, frame_idx: int, class_names, annots, offset: tuple):
-        """Remap cropped detections back to full-image coordinates and merge."""
         ox, oy = offset
         for box in annots:
             box.poly[:, 0] += ox
             box.poly[:, 1] += oy
 
         self.class_names = class_names
-        # Merge with existing predictions for this frame (append, don't replace)
         existing = self.pred_cache.get(frame_idx, [])
         existing.extend(annots)
         self.pred_cache[frame_idx] = existing
@@ -1271,12 +1304,21 @@ class AnnotatePage(QtWidgets.QWidget):
         self._status(f"Crop inference: {n} detection{'s' if n != 1 else ''} added.")
         self._cancel_crop_infer()
 
+        # Auto-detect task from model
+        self._auto_detect_task()
+
     def _on_cropped_error(self, msg: str):
         self.run_btn.setEnabled(True)
         self.run_btn.setText("Run Model")
         self._status(f"Crop inference error: {msg}")
         self._cancel_crop_infer()
 
+    def _auto_detect_task(self):
+        """Read the model task from DetectionWorker class cache."""
+        model_task = getattr(DetectionWorker, "_model_task", None)
+        if model_task:
+            self._task_type = model_task   # "obb" or "detect"
+            self._update_task_label()
 
     def run_model_cached(self):
         idx = self.current_idx
@@ -1286,7 +1328,6 @@ class AnnotatePage(QtWidgets.QWidget):
         self.run_btn.setText("Inference running...")
         conf = float(self.inference_conf_tresh.value())
 
-        # Prefer passing the file path directly to YOLO when possible
         source_path = None
         if isinstance(self.source, ImageFolderSource):
             source_path = self.source.path_at(idx)
@@ -1316,6 +1357,9 @@ class AnnotatePage(QtWidgets.QWidget):
         self.run_btn.setEnabled(True)
         self.run_btn.setText("Run Model")
         self._status(f"Predictions cached for frame {frame_idx + 1}.")
+
+        # Auto-detect task type from model
+        self._auto_detect_task()
 
     def _on_inference_error(self, msg: str):
         self.run_btn.setEnabled(True)
@@ -1361,7 +1405,6 @@ class AnnotatePage(QtWidgets.QWidget):
         bridge.finished.connect(self._on_finetune_done)
         self._finetune_bridge = bridge
 
-        # Connect to train page for live feedback
         train_page = getattr(self._launcher, "train_page", None) if self._launcher else None
         if train_page:
             train_page.reset_for_new_run()
@@ -1372,7 +1415,6 @@ class AnnotatePage(QtWidgets.QWidget):
             worker.progress.connect(bridge.progress)
             worker.error.connect(bridge.error)
             worker.finished.connect(bridge.finished)
-            # Per-epoch metrics and console lines → train page
             if train_page:
                 worker.epoch_metrics.connect(
                     lambda ep, tot, m: train_page.update_metrics(ep, tot, m)
@@ -1411,8 +1453,39 @@ class AnnotatePage(QtWidgets.QWidget):
         if self.source is None: return None
         return self.source.read(frame_idx)
 
-    def _poly_to_yolo_obb_line(self, box: PolyClass, img_w: int, img_h: int) -> str:
-        pts = box.poly.reshape(-1, 2)
+    def _is_axis_aligned(self, poly: np.ndarray, tol: float = 2.0) -> bool:
+        """Check if a 4-point polygon is (approximately) axis-aligned."""
+        pts = poly.reshape(4, 2)
+        # Check if edges are horizontal/vertical
+        for i in range(4):
+            dx = abs(pts[(i + 1) % 4, 0] - pts[i, 0])
+            dy = abs(pts[(i + 1) % 4, 1] - pts[i, 1])
+            if not (dx < tol or dy < tol):
+                return False
+        return True
+
+    def _poly_to_yolo_line(self, box: PolyClass, img_w: int, img_h: int) -> str:
+        """Convert a box to a YOLO label line.
+        - detect mode → 'cls cx cy w h'  (normalized)
+        - obb mode    → 'cls x1 y1 x2 y2 x3 y3 x4 y4' (normalized)
+        """
+        task = self._effective_task()
+        pts = box.poly.reshape(4, 2)
+
+        if task == "detect" or (task == "obb" and self._is_axis_aligned(pts)):
+            # Export as BBOX: cls cx cy w h
+            if task == "detect":
+                xs = pts[:, 0]
+                ys = pts[:, 1]
+                x1, x2 = float(xs.min()), float(xs.max())
+                y1, y2 = float(ys.min()), float(ys.max())
+                cx = (x1 + x2) / 2.0 / img_w
+                cy = (y1 + y2) / 2.0 / img_h
+                bw = (x2 - x1) / img_w
+                bh = (y2 - y1) / img_h
+                return f"{int(box.cls_id)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
+
+        # OBB format
         parts = [str(int(box.cls_id))]
         for x, y in pts:
             parts.append(f"{x / img_w:.6f}")
@@ -1444,7 +1517,7 @@ class AnnotatePage(QtWidgets.QWidget):
             split = "val" if random.random() < val_split else "train"
 
             cv2.imwrite(str(ds / "images" / split / f"{stem}.jpg"), img)
-            lines = [self._poly_to_yolo_obb_line(b, w, h) for b in boxes]
+            lines = [self._poly_to_yolo_line(b, w, h) for b in boxes]
             (ds / "labels" / split / f"{stem}.txt").write_text("\n".join(lines) + "\n")
             exported += 1
         return exported
@@ -1477,10 +1550,15 @@ class AnnotatePage(QtWidgets.QWidget):
         n_train = sum(1 for _ in (ds / "images" / "train").glob("*"))
         n_val = sum(1 for _ in (ds / "images" / "val").glob("*"))
 
-        self._status(f"Exported {n_new} new images → {self.dataset_dir}  (total: {n_train} train + {n_val} val)")
+        task = self._effective_task()
+        self._status(
+            f"Exported {n_new} new images ({task} format) → {self.dataset_dir}  "
+            f"(total: {n_train} train + {n_val} val)"
+        )
         QtWidgets.QMessageBox.information(
             self.window(), "Export done",
-            f"{n_new} new images exported to:\n{os.path.abspath(self.dataset_dir)}\n\n"
+            f"{n_new} new images exported ({task} format) to:\n"
+            f"{os.path.abspath(self.dataset_dir)}\n\n"
             f"Dataset totals: {n_train} train / {n_val} val",
         )
 
@@ -1547,7 +1625,7 @@ class AnnotatePage(QtWidgets.QWidget):
         elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
             if getattr(self, "_pan_dragging", False):
                 self._pan_dragging = False; return True
-            
+
         # CROP-INFER selection
         if self.mode == "crop_infer":
             if event.type() == QtCore.QEvent.Type.MouseButtonPress:
@@ -1573,7 +1651,45 @@ class AnnotatePage(QtWidgets.QWidget):
                     self.crop_end_img = None
                     self._run_cropped_inference(x1, y1, x2, y2)
                     return True
-                
+
+        # BBOX add mode (click + drag + release)
+        if self.mode == "add_bbox":
+            if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                    self.bbox_start_img = (x_img, y_img)
+                    self.bbox_end_img = (x_img, y_img)
+                    self.bbox_selecting = True
+                    return True
+            elif event.type() == QtCore.QEvent.Type.MouseMove:
+                if self.bbox_selecting:
+                    self.bbox_end_img = (x_img, y_img)
+                    self.redraw_current()
+                    return True
+            elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                if self.bbox_selecting and event.button() == QtCore.Qt.MouseButton.LeftButton:
+                    self.bbox_end_img = (x_img, y_img)
+                    self.bbox_selecting = False
+                    sx, sy = self.bbox_start_img
+                    ex, ey = self.bbox_end_img
+                    x1, y1 = min(sx, ex), min(sy, ey)
+                    x2, y2 = max(sx, ex), max(sy, ey)
+                    if abs(x2 - x1) > 3 and abs(y2 - y1) > 3:
+                        pts = np.array([
+                            [x1, y1], [x2, y1], [x2, y2], [x1, y2]
+                        ], dtype=np.float32)
+                        new_box = OBBOX(poly=pts, cls_id=0, conf=1.0, verified=False)
+                        self.pred_cache.setdefault(self.current_idx, []).append(new_box)
+                        self.selected_idx = len(self.pred_cache[self.current_idx]) - 1
+                        self.update_dataset_for_frame(self.current_idx)
+                        self._status("BBox added.")
+                    else:
+                        self._status("Box too small, ignored.")
+                    self.bbox_start_img = None
+                    self.bbox_end_img = None
+                    self.set_mode("select")
+                    self.redraw_current()
+                    return True
+
         # LEFT CLICK
         if event.type() == QtCore.QEvent.Type.MouseButtonPress:
             if event.button() == QtCore.Qt.MouseButton.LeftButton:
@@ -1704,15 +1820,30 @@ class AnnotatePage(QtWidgets.QWidget):
 
     def set_mode(self, mode: str):
         self.mode = mode
-        if mode != "add": self.temp_poly_pts.clear()
+        if mode != "add":
+            self.temp_poly_pts.clear()
+        if mode != "add_bbox":
+            self.bbox_start_img = None
+            self.bbox_end_img = None
+            self.bbox_selecting = False
         self._status(f"Mode: {mode}")
 
     def start_add_mode(self):
         self.set_mode("add"); self.selected_idx = None; self.redraw_current()
 
+    def start_add_bbox_mode(self):
+        self.set_mode("add_bbox"); self.selected_idx = None
+        self._status("BBox mode: click and drag to draw a rectangle.")
+        self.redraw_current()
+
     def cancel_add_mode(self):
         if self.mode == "add":
             self.temp_poly_pts.clear(); self.set_mode("select"); self.redraw_current()
+        elif self.mode == "add_bbox":
+            self.bbox_start_img = None
+            self.bbox_end_img = None
+            self.bbox_selecting = False
+            self.set_mode("select"); self.redraw_current()
         elif self.mode == "crop_infer":
             self._cancel_crop_infer()
 
@@ -1838,27 +1969,22 @@ class LauncherWindow(QtWidgets.QMainWindow):
         # =============== Stacked pages ===============
         self.stack = QtWidgets.QStackedWidget()
 
-        # Page 0: Settings
         self.settings_page = SettingsPage()
         self.settings_page.config_changed.connect(self._save_current_config)
         self.stack.addWidget(self.settings_page)
 
-        # Page 1: Annotate
         self.annotate_page = AnnotatePage()
         self.annotate_page.set_launcher(self)
         self.stack.addWidget(self.annotate_page)
 
-        # Page 2: Inspect Dataset
         self.inspect_page = InspectDatasetPage()
         self.inspect_page.set_launcher(self)
         self.stack.addWidget(self.inspect_page)
 
-        # Page 3: Train Detector
         self.train_page = TrainPage()
         self.train_page.set_launcher(self)
         self.stack.addWidget(self.train_page)
 
-        # Page 4: Tracking
         self.tracking_page = TrackingPage()
         self.tracking_page.set_launcher(self)
         self.stack.addWidget(self.tracking_page)
@@ -1887,6 +2013,8 @@ class LauncherWindow(QtWidgets.QMainWindow):
                         activated=self.annotate_page.delete_selected)
         QtGui.QShortcut(QtGui.QKeySequence("N"), self,
                         activated=self.annotate_page.start_add_mode)
+        QtGui.QShortcut(QtGui.QKeySequence("B"), self,
+                        activated=self.annotate_page.start_add_bbox_mode)
         QtGui.QShortcut(QtGui.QKeySequence("E"), self,
                         activated=self.annotate_page.toggle_edit_mode)
         QtGui.QShortcut(QtGui.QKeySequence("Esc"), self,
@@ -1939,7 +2067,7 @@ class LauncherWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(
             self, "About",
             "Annotation & Active Learning Tool\n"
-            "YOLO-OBB detection with human-in-the-loop finetuning\n"
+            "YOLO-OBB / YOLO-Detect with human-in-the-loop finetuning\n"
             "Built with PySide6",
         )
 
@@ -1975,7 +2103,6 @@ class LauncherWindow(QtWidgets.QMainWindow):
             return
         self._current_project = name
         self.project_label.setText(f"Project: {name}")
-        # Ensure project dirs exist
         self.pm.create_project(name)
         cfg = self.pm.load_config(name)
         self.settings_page.load_config(cfg)
@@ -2000,7 +2127,6 @@ class LauncherWindow(QtWidgets.QMainWindow):
 
     def _switch_tab(self, idx: int):
         self.stack.setCurrentIndex(idx)
-        # Auto-refresh the inspect page when entering it
         if idx == 2:
             self.inspect_page.refresh()
 
