@@ -3,12 +3,18 @@ Tracking page — BoxMOT BoTSORT with AABB detections.
 OBB detections are converted to axis-aligned bounding boxes for the tracker,
 then track IDs are mapped back onto the original OBBs.
 Trajectories are read from the tracker's internal STrack history_observations.
+
+Exports:
+  per_frame/frame_XXXXXX.txt  — one line per detection
+  per_track/track_XXXX.json   — full history per track ID
 """
 
 import os
+import json
 import math
 from typing import Optional, List, Dict, Tuple
 from pathlib import Path
+from collections import defaultdict
 
 import cv2
 import numpy as np
@@ -95,6 +101,33 @@ def obb_to_aabb_row(box: OBBOX) -> np.ndarray:
 def obb_centroid(box: OBBOX) -> Tuple[float, float]:
     pts = box.poly.reshape(-1, 2)
     return float(pts[:, 0].mean()), float(pts[:, 1].mean())
+
+
+# ---------------------------------------------------------------------------
+# Update a BotSort STrack's Kalman state from an AABB
+# ---------------------------------------------------------------------------
+
+def _update_strack_bbox(strack, x1, y1, x2, y2):
+    """Best-effort update of a STrack's internal Kalman mean to match a new AABB.
+    BotSort state format is typically [cx, cy, aspect_ratio, h, vx, vy, va, vh].
+    """
+    mean = getattr(strack, "mean", None)
+    if mean is None or len(mean) < 4:
+        return
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    w = max(x2 - x1, 1e-6)
+    h = max(y2 - y1, 1e-6)
+    mean[0] = cx
+    mean[1] = cy
+    mean[2] = w / h          # aspect ratio
+    mean[3] = h
+    # Zero velocities so the Kalman prediction doesn't drift from old momentum
+    if len(mean) >= 8:
+        mean[4] = 0.0
+        mean[5] = 0.0
+        mean[6] = 0.0
+        mean[7] = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -337,13 +370,13 @@ class TrackingStepWorker(QtCore.QObject):
 
 
 # ---------------------------------------------------------------------------
-# Video export worker  ← NEW
+# Video export worker
 # ---------------------------------------------------------------------------
 
 class VideoExportWorker(QtCore.QObject):
     """Renders every tracked frame with annotations + trajectories to a .mp4."""
-    progress = QtCore.Signal(int, int)   # done, total
-    finished = QtCore.Signal(str)        # output path
+    progress = QtCore.Signal(int, int)
+    finished = QtCore.Signal(str)
     error    = QtCore.Signal(str)
 
     def __init__(self, source: FrameSource, track_cache: Dict[int, List[OBBOX]],
@@ -363,33 +396,21 @@ class VideoExportWorker(QtCore.QObject):
     def run(self):
         try:
             if not self.track_cache:
-                self.error.emit("Nothing to export — run the tracker first.")
-                return
-
-            # Determine the frame range: from 0 up to the last tracked frame
+                self.error.emit("Nothing to export — run the tracker first."); return
             last_idx = max(self.track_cache.keys())
             total = last_idx + 1
-
-            # Read first frame to get dimensions
             sample = self.source.read(0)
             if sample is None:
                 self.error.emit("Cannot read first frame."); return
             sample = ensure_bgr_u8(sample)
             h, w = sample.shape[:2]
-
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(self.output_path, fourcc,
-                                     self.fps, (w, h))
+            writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (w, h))
             if not writer.isOpened():
-                self.error.emit(f"Cannot open VideoWriter for {self.output_path}")
-                return
-
-            # For frames between tracked key-frames we use the closest
-            # earlier snapshot so trajectories stay visible.
+                self.error.emit(f"Cannot open VideoWriter for {self.output_path}"); return
             sorted_keys = sorted(self.track_cache.keys())
 
             def _closest_earlier(idx, keys):
-                """Return the largest key <= idx, or None."""
                 lo, hi, best = 0, len(keys) - 1, None
                 while lo <= hi:
                     mid = (lo + hi) // 2
@@ -402,18 +423,12 @@ class VideoExportWorker(QtCore.QObject):
             for idx in range(total):
                 frame = self.source.read(idx)
                 if frame is None:
-                    # Write a black frame to keep timing
                     writer.write(np.zeros((h, w, 3), dtype=np.uint8))
-                    self.progress.emit(idx + 1, total)
-                    continue
+                    self.progress.emit(idx + 1, total); continue
                 frame = ensure_bgr_u8(frame)
-
-                # Find annotations & trajectories for this frame
                 annots = self.track_cache.get(idx, [])
                 snap_key = _closest_earlier(idx, sorted_keys)
-                trajectories = self.traj_snapshots.get(
-                    snap_key, {}) if snap_key is not None else {}
-
+                trajectories = self.traj_snapshots.get(snap_key, {}) if snap_key is not None else {}
                 rendered = draw_tracked_annotations(
                     frame, annots, selected_idx=None,
                     trajectories=trajectories,
@@ -422,10 +437,8 @@ class VideoExportWorker(QtCore.QObject):
                 )
                 writer.write(rendered)
                 self.progress.emit(idx + 1, total)
-
             writer.release()
             self.finished.emit(self.output_path)
-
         except Exception as e:
             import traceback; traceback.print_exc()
             self.error.emit(str(e))
@@ -467,6 +480,9 @@ class TrackingPage(QtWidgets.QWidget):
         self.orig_poly = None
         self.vertex_drag_idx = None
 
+        # ── Pending edit bookkeeping for tracker sync ──
+        self._pending_id_changes: Dict[int, int] = {}   # old_tid → new_tid
+
         # ================ UI ================
         self.canvas = QtWidgets.QLabel()
         self.canvas.setMouseTracking(True)
@@ -496,11 +512,19 @@ class TrackingPage(QtWidgets.QWidget):
 
         self.reset_tracker_btn = QtWidgets.QPushButton("Reset Tracker")
 
-        # ── Export button ← NEW ──
+        # ── Export video button ──
         self.export_btn = QtWidgets.QPushButton("Export Video 🎬")
         self.export_btn.setFixedHeight(36)
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._export_video)
+
+        # ── Export data button ──
+        self.export_data_btn = QtWidgets.QPushButton("Export Data 📊")
+        self.export_data_btn.setToolTip(
+            "Export per_frame/*.txt + per_track/*.json (no images)")
+        self.export_data_btn.setFixedHeight(36)
+        self.export_data_btn.setEnabled(False)
+        self.export_data_btn.clicked.connect(self._export_data)
 
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0)
@@ -594,10 +618,10 @@ class TrackingPage(QtWidgets.QWidget):
         el.addWidget(self.edit_btn); el.addWidget(self.id_spin)
         el.addWidget(self.delete_btn)
 
-        # ── Export group ← NEW ──
         exp = QtWidgets.QGroupBox("Export")
         xl = QtWidgets.QVBoxLayout(exp)
         xl.addWidget(self.export_btn)
+        xl.addWidget(self.export_data_btn)
 
         v.addWidget(src); v.addWidget(trk); v.addWidget(vis)
         v.addWidget(edit); v.addWidget(exp)
@@ -656,6 +680,7 @@ class TrackingPage(QtWidgets.QWidget):
         self.track_cache.clear()
         self.selected_idx = None
         self.mode = "select"
+        self._pending_id_changes.clear()
         self.frame_slider.setRange(0, max(0, self.total_frames - 1))
         self.frame_slider.setValue(0)
         self._reset_tracker()
@@ -680,7 +705,7 @@ class TrackingPage(QtWidgets.QWidget):
         self.frame_slider.blockSignals(False)
         self.selected_idx = None
         self._update_step_btn()
-        self._update_export_btn()
+        self._update_export_btns()
         self._update_id_spin()
         self._redraw()
         if self._launcher:
@@ -795,20 +820,82 @@ class TrackingPage(QtWidgets.QWidget):
         self._redraw()
 
     # ==================================================================
-    # Tracker
+    # Tracker — sync edits into BoxMOT internal state
+    # ==================================================================
+
+    def _sync_edits_to_tracker(self):
+        """Push user edits (delete / move / ID change) from track_cache back
+        into the BoxMOT tracker's internal STracks so the next .update() call
+        starts from the corrected state."""
+        if self.tracker is None or self.last_tracked_idx < 0:
+            return
+
+        annots = self.track_cache.get(self.last_tracked_idx, [])
+
+        # ── 1. Apply pending ID changes ──
+        if self._pending_id_changes:
+            for attr in ("active_tracks", "lost_stracks"):
+                pool = getattr(self.tracker, attr, None)
+                if pool is None:
+                    continue
+                for st in pool:
+                    old_tid = int(getattr(st, "id", -1))
+                    if old_tid in self._pending_id_changes:
+                        try:
+                            st.id = self._pending_id_changes[old_tid]
+                        except Exception:
+                            pass
+            self._pending_id_changes.clear()
+
+        # ── 2. Remove deleted tracks ──
+        deleted_tids = {b.track_id for b in annots
+                        if b.deleted and b.track_id >= 0}
+        if deleted_tids:
+            for attr in ("active_tracks", "lost_stracks"):
+                pool = getattr(self.tracker, attr, None)
+                if pool is None:
+                    continue
+                to_rm = [st for st in pool
+                         if int(getattr(st, "id", -1)) in deleted_tids]
+                for st in to_rm:
+                    pool.remove(st)
+
+        # ── 3. Update positions for surviving tracks ──
+        active_map: Dict[int, Tuple[float, float, float, float]] = {}
+        for b in annots:
+            if not b.deleted and b.track_id >= 0:
+                pts = b.poly.reshape(-1, 2)
+                x1, y1 = float(pts[:, 0].min()), float(pts[:, 1].min())
+                x2, y2 = float(pts[:, 0].max()), float(pts[:, 1].max())
+                active_map[b.track_id] = (x1, y1, x2, y2)
+
+        if active_map:
+            for attr in ("active_tracks", "lost_stracks"):
+                pool = getattr(self.tracker, attr, None)
+                if pool is None:
+                    continue
+                for st in pool:
+                    tid = int(getattr(st, "id", -1))
+                    if tid in active_map:
+                        try:
+                            _update_strack_bbox(st, *active_map[tid])
+                        except Exception:
+                            pass
+
+    # ==================================================================
+    # Tracker — step
     # ==================================================================
 
     def _update_step_btn(self):
         self.step_btn.setEnabled(
             self.source is not None and self.current_idx > self.last_tracked_idx)
 
-    def _update_export_btn(self):
-        """Enable export only when we have tracked data and nothing is running."""
-        self.export_btn.setEnabled(
-            bool(self.track_cache)
-            and not self._tracking_running
-            and not self._exporting
-        )
+    def _update_export_btns(self):
+        ok = (bool(self.track_cache)
+              and not self._tracking_running
+              and not self._exporting)
+        self.export_btn.setEnabled(ok)
+        self.export_data_btn.setEnabled(ok)
 
     def _reset_tracker(self):
         self.tracker = None
@@ -816,8 +903,9 @@ class TrackingPage(QtWidgets.QWidget):
         self.track_cache.clear()
         self.traj_snapshots.clear()
         self.selected_idx = None
+        self._pending_id_changes.clear()
         self._update_step_btn()
-        self._update_export_btn()
+        self._update_export_btns()
         self._redraw()
         self._status("Tracker reset.")
 
@@ -837,7 +925,9 @@ class TrackingPage(QtWidgets.QWidget):
         self.id_spin.setEnabled(enabled and self.selected_idx is not None)
         self.conf_spin.setEnabled(enabled)
         self.frame_skip_spin.setEnabled(enabled)
-        self.export_btn.setEnabled(enabled and bool(self.track_cache))
+        ok = enabled and bool(self.track_cache)
+        self.export_btn.setEnabled(ok)
+        self.export_data_btn.setEnabled(ok)
 
     def _step_tracker(self):
         if not self.source or self.current_idx <= self.last_tracked_idx:
@@ -848,6 +938,9 @@ class TrackingPage(QtWidgets.QWidget):
             self.tracker = build_tracker(self._cfg())
             self.last_tracked_idx = -1
             self._status("Tracker initialised (BoTSORT AABB).")
+
+        # ── Sync any user edits into the tracker before stepping ──
+        self._sync_edits_to_tracker()
 
         start = self.last_tracked_idx + 1
         end = self.current_idx
@@ -903,7 +996,7 @@ class TrackingPage(QtWidgets.QWidget):
         self._set_ui_locked(False)
         self.step_btn.setText("Step Tracker ▶▶")
         self._update_step_btn()
-        self._update_export_btn()
+        self._update_export_btns()
         self.progress_bar.setFormat("Done")
         self._redraw()
         last_snap = self.traj_snapshots.get(self.last_tracked_idx, {})
@@ -914,13 +1007,13 @@ class TrackingPage(QtWidgets.QWidget):
         self._set_ui_locked(False)
         self.step_btn.setText("Step Tracker ▶▶")
         self._update_step_btn()
-        self._update_export_btn()
+        self._update_export_btns()
         self.progress_bar.setFormat("Error")
         self._status(f"Tracking error: {msg}")
         QtWidgets.QMessageBox.critical(self, "Tracking Error", msg)
 
     # ==================================================================
-    # Video export  ← NEW
+    # Video export
     # ==================================================================
 
     def _export_video(self):
@@ -928,35 +1021,28 @@ class TrackingPage(QtWidgets.QWidget):
             return
         if self._tracking_running or self._exporting:
             return
-
-        # Default filename next to the source
         default_name = "tracked_output.mp4"
         if hasattr(self.source, "path"):
             src_path = Path(self.source.path)
             default_name = str(src_path.with_name(src_path.stem + "_tracked.mp4"))
-
         out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Export tracked video", default_name,
             "Video (*.mp4);;All (*)")
         if not out_path:
             return
-
         fps = (self.source.fps() or 25)
-
         self._exporting = True
         self._set_ui_locked(True)
         self.export_btn.setEnabled(False)
         self.export_btn.setText("Exporting...")
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Export 0/?")
-
         self._exp_thread = QtCore.QThread(self)
         self._exp_worker = VideoExportWorker(
             source=self.source,
-            track_cache=dict(self.track_cache),       # shallow copy
-            traj_snapshots=dict(self.traj_snapshots),  # shallow copy
-            output_path=out_path,
-            fps=fps,
+            track_cache=dict(self.track_cache),
+            traj_snapshots=dict(self.traj_snapshots),
+            output_path=out_path, fps=fps,
             trail_length=self.trail_len_spin.value(),
             show_trails=self.show_trails_chk.isChecked(),
         )
@@ -980,21 +1066,117 @@ class TrackingPage(QtWidgets.QWidget):
         self._exporting = False
         self._set_ui_locked(False)
         self.export_btn.setText("Export Video 🎬")
-        self._update_export_btn()
+        self._update_export_btns()
         self.progress_bar.setFormat("Export done")
         self._status(f"Video exported → {path}")
         QtWidgets.QMessageBox.information(
-            self, "Export complete",
-            f"Video saved to:\n{path}")
+            self, "Export complete", f"Video saved to:\n{path}")
 
     def _on_export_error(self, msg):
         self._exporting = False
         self._set_ui_locked(False)
         self.export_btn.setText("Export Video 🎬")
-        self._update_export_btn()
+        self._update_export_btns()
         self.progress_bar.setFormat("Export error")
         self._status(f"Export error: {msg}")
         QtWidgets.QMessageBox.critical(self, "Export Error", msg)
+
+    # ==================================================================
+    # Data export  (per_frame/*.txt  +  per_track/*.json)
+    # ==================================================================
+
+    def _export_data(self):
+        if not self.track_cache:
+            return
+        if self._tracking_running or self._exporting:
+            return
+
+        out_dir = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select output folder for tracking data")
+        if not out_dir:
+            return
+
+        pf_dir = Path(out_dir) / "per_frame"
+        pt_dir = Path(out_dir) / "per_track"
+        pf_dir.mkdir(parents=True, exist_ok=True)
+        pt_dir.mkdir(parents=True, exist_ok=True)
+
+        # Collect per-track data while writing per-frame files
+        per_track: Dict[int, list] = defaultdict(list)
+        n_frames = 0
+        n_detections = 0
+
+        header = (
+            "# track_id centroid_x centroid_y "
+            "bbox_x1 bbox_y1 bbox_x2 bbox_y2 "
+            "obb_x1 obb_y1 obb_x2 obb_y2 obb_x3 obb_y3 obb_x4 obb_y4 "
+            "confidence class_id\n"
+        )
+
+        for frame_idx in sorted(self.track_cache.keys()):
+            annots = self.track_cache[frame_idx]
+            active = [b for b in annots if not b.deleted and b.track_id >= 0]
+            if not active:
+                continue
+
+            lines = [header]
+            for b in active:
+                pts = b.poly.reshape(4, 2)
+                cx, cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
+                bx1, by1 = float(pts[:, 0].min()), float(pts[:, 1].min())
+                bx2, by2 = float(pts[:, 0].max()), float(pts[:, 1].max())
+                obb_flat = " ".join(f"{pts[i, j]:.2f}"
+                                    for i in range(4) for j in range(2))
+                line = (
+                    f"{b.track_id} "
+                    f"{cx:.2f} {cy:.2f} "
+                    f"{bx1:.2f} {by1:.2f} {bx2:.2f} {by2:.2f} "
+                    f"{obb_flat} "
+                    f"{b.conf:.4f} {b.cls_id}\n"
+                )
+                lines.append(line)
+
+                # Accumulate for per_track
+                per_track[b.track_id].append({
+                    "frame": frame_idx,
+                    "centroid": [round(cx, 2), round(cy, 2)],
+                    "bbox": [round(bx1, 2), round(by1, 2),
+                             round(bx2, 2), round(by2, 2)],
+                    "obb": [[round(float(pts[i, 0]), 2),
+                             round(float(pts[i, 1]), 2)] for i in range(4)],
+                    "confidence": round(b.conf, 4),
+                    "class_id": b.cls_id,
+                })
+
+            txt_path = pf_dir / f"frame_{frame_idx:06d}.txt"
+            txt_path.write_text("".join(lines))
+            n_frames += 1
+            n_detections += len(active)
+
+        # Write per-track JSON files
+        for tid, detections in sorted(per_track.items()):
+            record = {
+                "track_id": tid,
+                "num_detections": len(detections),
+                "first_frame": detections[0]["frame"],
+                "last_frame": detections[-1]["frame"],
+                "detections": detections,
+            }
+            json_path = pt_dir / f"track_{tid:04d}.json"
+            json_path.write_text(
+                json.dumps(record, indent=2, ensure_ascii=False))
+
+        n_tracks = len(per_track)
+        self._status(
+            f"Exported {n_detections} detections across {n_frames} frames, "
+            f"{n_tracks} tracks → {out_dir}")
+        QtWidgets.QMessageBox.information(
+            self, "Data export complete",
+            f"Exported to: {out_dir}\n\n"
+            f"per_frame/  → {n_frames} files\n"
+            f"per_track/  → {n_tracks} JSON files\n"
+            f"Total detections: {n_detections}",
+        )
 
     # ==================================================================
     # Selection / editing
@@ -1006,7 +1188,8 @@ class TrackingPage(QtWidgets.QWidget):
 
     def _delete_selected(self):
         annots = self.track_cache.get(self.current_idx, [])
-        if self.selected_idx is None or self.selected_idx >= len(annots): return
+        if self.selected_idx is None or self.selected_idx >= len(annots):
+            return
         annots[self.selected_idx].deleted = True
         self.selected_idx = None
         self._update_id_spin(); self._redraw()
@@ -1029,7 +1212,12 @@ class TrackingPage(QtWidgets.QWidget):
     def _on_id_spin_changed(self, val):
         annots = self.track_cache.get(self.current_idx, [])
         if self.selected_idx is not None and self.selected_idx < len(annots):
-            annots[self.selected_idx].track_id = val
+            old_id = annots[self.selected_idx].track_id
+            if old_id != val:
+                annots[self.selected_idx].track_id = val
+                # Remember old→new so _sync_edits_to_tracker can find the STrack
+                if old_id >= 0:
+                    self._pending_id_changes[old_id] = val
             self._redraw()
 
     def _pick_annot(self, x, y):
