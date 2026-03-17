@@ -211,6 +211,7 @@ __marimo__/
 # Data
 
 *.mp4
+*.MP4
 
 # torch model
 *.pt

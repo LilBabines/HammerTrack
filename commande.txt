@@ -1,2 +1,2 @@
-ffmpeg -ss 00:09:00 -to 00:10:00 -i /mnt/sda2/HAMMER/data/SIMP2324/SIMP2324_016.mp4 -r 10 -c:v libx264 -crf 18 clip_simp2324_016_09-00_10-00.mp4
+ffmpeg -ss 00:04:00 -to 00:08:00 -i /mnt/sda2/HAMMER/data/SIMP1920/SIMP1920_122.mp4 -c:v libx264 -crf 18 SIMP1920_122-04-08.mp4
 

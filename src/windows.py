@@ -844,6 +844,10 @@ class AnnotatePage(QtWidgets.QWidget):
         self.orig_poly: Optional[np.ndarray] = None
         self.vertex_drag_idx: Optional[int] = None
 
+        self.crop_start_img: Optional[tuple] = None   # (x, y) in image coords
+        self.crop_end_img: Optional[tuple] = None      # (x, y) in image coords
+        self.crop_selecting = False
+
         # --- Model ---
         self.model_worker = DetectionWorker
         self.model_path = YOLO_MODEL_PATH
@@ -883,6 +887,12 @@ class AnnotatePage(QtWidgets.QWidget):
         self.export_dataset_btn = QtWidgets.QPushButton("Export to Dataset (D)")
         self.play_btn = QtWidgets.QPushButton("Play ▶")
         self.pause_btn = QtWidgets.QPushButton("Pause ⏸")
+
+        self.crop_infer_btn = QtWidgets.QPushButton("⬒")
+        self.crop_infer_btn.setToolTip("Select a region and run inference on it")
+        self.crop_infer_btn.setFixedSize(32, 32)
+        self.crop_infer_btn.setCheckable(True)
+        self.crop_infer_btn.clicked.connect(self._toggle_crop_infer_mode)
 
         self.inference_conf_tresh = QtWidgets.QDoubleSpinBox()
         self.inference_conf_tresh.setRange(0.01, 0.99)
@@ -968,7 +978,13 @@ class AnnotatePage(QtWidgets.QWidget):
         # Inference group
         infer_box = QtWidgets.QGroupBox("Inference")
         infer_l = QtWidgets.QVBoxLayout(infer_box)
-        infer_l.addWidget(self.run_btn)
+
+        # Run model row: [Run Model] [⬒]
+        run_row = QtWidgets.QHBoxLayout()
+        run_row.addWidget(self.run_btn)
+        run_row.addWidget(self.crop_infer_btn)
+        infer_l.addLayout(run_row)
+
         infer_l.addWidget(self.inference_conf_tresh)
         infer_l.addWidget(self.export_dataset_btn)
 
@@ -1111,6 +1127,24 @@ class AnnotatePage(QtWidgets.QWidget):
             for (gx, gy) in ghost:
                 cv2.circle(annotated, (int(gx), int(gy)), 3,
                            (200, 200, 200), -1, lineType=cv2.LINE_AA)
+                
+        # Draw crop-inference selection rectangle
+        if self.mode == "crop_infer" and self.crop_start_img and self.crop_end_img:
+            sx, sy = self.crop_start_img
+            ex, ey = self.crop_end_img
+            x1, y1 = int(min(sx, ex)), int(min(sy, ey))
+            x2, y2 = int(max(sx, ex)), int(max(sy, ey))
+            # Semi-transparent overlay outside the selection
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (0, 0), (annotated.shape[1], annotated.shape[0]),
+                          (0, 0, 0), -1)
+            mask = np.zeros(annotated.shape[:2], dtype=np.uint8)
+            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+            annotated = np.where(mask[..., None] == 255, annotated,
+                                 cv2.addWeighted(annotated, 0.3, overlay, 0.7, 0))
+            # Selection border
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 200, 255), 2)
+
         self.show_frame(annotated)
 
     # ==================== Playback controls ====================
@@ -1144,6 +1178,105 @@ class AnnotatePage(QtWidgets.QWidget):
         self.read_frame(self.current_idx + 1)
 
     # ==================== Model inference ====================
+
+    def _toggle_crop_infer_mode(self, checked: bool):
+        """Toggle crop-inference selection mode."""
+        if checked:
+            self.set_mode("crop_infer")
+            self.crop_start_img = None
+            self.crop_end_img = None
+            self.crop_selecting = False
+            self._status("Crop inference: drag a rectangle on the image, release to run.")
+        else:
+            self.crop_selecting = False
+            self.crop_start_img = None
+            self.crop_end_img = None
+            self.set_mode("select")
+            self.redraw_current()
+
+    def _cancel_crop_infer(self):
+        """Exit crop-inference mode cleanly."""
+        self.crop_infer_btn.setChecked(False)
+        self.crop_selecting = False
+        self.crop_start_img = None
+        self.crop_end_img = None
+        self.set_mode("select")
+        self.redraw_current()
+
+    def _run_cropped_inference(self, x1: int, y1: int, x2: int, y2: int):
+        """Run the model on a sub-region, then remap boxes back to full image."""
+        if self.current_frame_bgr is None:
+            return
+
+        h_img, w_img = self.current_frame_bgr.shape[:2]
+        # Clamp to image bounds
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w_img, x2), min(h_img, y2)
+        if x2 - x1 < 10 or y2 - y1 < 10:
+            self._status("Selection too small, ignored.")
+            self._cancel_crop_infer()
+            return
+
+        crop = self.current_frame_bgr[y1:y2, x1:x2].copy()
+        offset = (x1, y1)
+
+        self.run_btn.setEnabled(False)
+        self.run_btn.setText("Crop inference...")
+        conf = float(self.inference_conf_tresh.value())
+        cfg = self._launcher.project_config() if self._launcher else {}
+
+        self._crop_thread = QtCore.QThread(self)
+        self._crop_worker = self.model_worker(
+            frame_idx=self.current_idx,
+            frame_bgr=crop,
+            conf=conf,
+            imgsz=cfg.get("imgsz", 1024),
+            model_path=self.model_path,
+            source_path=None,  # force numpy path for the crop
+        )
+        self._crop_worker.moveToThread(self._crop_thread)
+        self._crop_thread.started.connect(self._crop_worker.run)
+
+        # Use a lambda to pass the offset alongside the normal signal
+        self._crop_worker.finished.connect(
+            lambda idx, names, boxes: self._on_cropped_done(idx, names, boxes, offset)
+        )
+        self._crop_worker.error.connect(self._on_cropped_error)
+        self._crop_worker.finished.connect(self._crop_thread.quit)
+        self._crop_worker.error.connect(self._crop_thread.quit)
+        self._crop_thread.finished.connect(self._crop_worker.deleteLater)
+        self._crop_thread.finished.connect(self._crop_thread.deleteLater)
+        self._crop_thread.start()
+
+    def _on_cropped_done(self, frame_idx: int, class_names, annots, offset: tuple):
+        """Remap cropped detections back to full-image coordinates and merge."""
+        ox, oy = offset
+        for box in annots:
+            box.poly[:, 0] += ox
+            box.poly[:, 1] += oy
+
+        self.class_names = class_names
+        # Merge with existing predictions for this frame (append, don't replace)
+        existing = self.pred_cache.get(frame_idx, [])
+        existing.extend(annots)
+        self.pred_cache[frame_idx] = existing
+
+        self.selected_idx = None
+        if frame_idx == self.current_idx:
+            self.redraw_current()
+
+        self.run_btn.setEnabled(True)
+        self.run_btn.setText("Run Model")
+        n = len(annots)
+        self._status(f"Crop inference: {n} detection{'s' if n != 1 else ''} added.")
+        self._cancel_crop_infer()
+
+    def _on_cropped_error(self, msg: str):
+        self.run_btn.setEnabled(True)
+        self.run_btn.setText("Run Model")
+        self._status(f"Crop inference error: {msg}")
+        self._cancel_crop_infer()
+
 
     def run_model_cached(self):
         idx = self.current_idx
@@ -1414,7 +1547,33 @@ class AnnotatePage(QtWidgets.QWidget):
         elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
             if getattr(self, "_pan_dragging", False):
                 self._pan_dragging = False; return True
-
+            
+        # CROP-INFER selection
+        if self.mode == "crop_infer":
+            if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                    self.crop_start_img = (x_img, y_img)
+                    self.crop_end_img = (x_img, y_img)
+                    self.crop_selecting = True
+                    return True
+            elif event.type() == QtCore.QEvent.Type.MouseMove:
+                if self.crop_selecting:
+                    self.crop_end_img = (x_img, y_img)
+                    self.redraw_current()
+                    return True
+            elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                if self.crop_selecting and event.button() == QtCore.Qt.MouseButton.LeftButton:
+                    self.crop_end_img = (x_img, y_img)
+                    self.crop_selecting = False
+                    sx, sy = self.crop_start_img
+                    ex, ey = self.crop_end_img
+                    x1, x2 = int(min(sx, ex)), int(max(sx, ex))
+                    y1, y2 = int(min(sy, ey)), int(max(sy, ey))
+                    self.crop_start_img = None
+                    self.crop_end_img = None
+                    self._run_cropped_inference(x1, y1, x2, y2)
+                    return True
+                
         # LEFT CLICK
         if event.type() == QtCore.QEvent.Type.MouseButtonPress:
             if event.button() == QtCore.Qt.MouseButton.LeftButton:
@@ -1554,6 +1713,8 @@ class AnnotatePage(QtWidgets.QWidget):
     def cancel_add_mode(self):
         if self.mode == "add":
             self.temp_poly_pts.clear(); self.set_mode("select"); self.redraw_current()
+        elif self.mode == "crop_infer":
+            self._cancel_crop_infer()
 
     def toggle_edit_mode(self):
         self.set_mode("edit" if self.mode != "edit" else "select")
