@@ -1,6 +1,5 @@
 from ultralytics import YOLO
 import argparse
-import albumentations as A
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a YOLO26 model")
@@ -17,7 +16,7 @@ def parse_args():
     parser.add_argument(
         "--data",
         type=str,
-        required=True,
+        default="datasets/dataset_build/data.yaml",
         help="Path to the dataset config file (e.g. data.yaml)",
     )
 
@@ -59,7 +58,7 @@ def main():
         workers=args.workers,
         device=args.device,
         flipud= True,
-        # cutmix = 0.2,
+        cutmix = 0.2,
         # augmentations= a
         
     )

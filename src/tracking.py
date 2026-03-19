@@ -12,7 +12,7 @@ Exports:
 import os
 import json
 import math
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 from pathlib import Path
 from collections import defaultdict
 
@@ -101,6 +101,18 @@ def obb_to_aabb_row(box: OBBOX) -> np.ndarray:
 def obb_centroid(box: OBBOX) -> Tuple[float, float]:
     pts = box.poly.reshape(-1, 2)
     return float(pts[:, 0].mean()), float(pts[:, 1].mean())
+
+
+# ---------------------------------------------------------------------------
+# OBB → xywhr (centre, width, height, angle in degrees)
+# ---------------------------------------------------------------------------
+
+def obb_to_xywhr(poly: np.ndarray) -> Tuple[float, float, float, float, float]:
+    """Return (cx, cy, w, h, angle_deg) from a 4-point OBB polygon."""
+    pts = poly.reshape(4, 2).astype(np.float32)
+    (cx, cy), (w, h), angle = cv2.minAreaRect(pts)
+    return (round(cx, 2), round(cy, 2),
+            round(w, 2), round(h, 2), round(angle, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +266,7 @@ def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 class TrackingStepWorker(QtCore.QObject):
     frame_tracked = QtCore.Signal(int, object)
     traj_snapshot = QtCore.Signal(int, object)
+    cmc_snapshot  = QtCore.Signal(int, object)   # frame_idx, 2×3 or 3×3 ndarray
     progress      = QtCore.Signal(int, int)
     finished      = QtCore.Signal()
     error         = QtCore.Signal(str)
@@ -332,6 +345,18 @@ class TrackingStepWorker(QtCore.QObject):
                 used.add(best_det)
         return obbs
 
+    @staticmethod
+    def _extract_cmc_matrix(tracker) -> Optional[np.ndarray]:
+        """Best-effort extraction of the Camera Motion Compensation warp matrix
+        from a BoxMOT tracker.  Returns a 2×3 (affine) or 3×3 (homography)
+        numpy array, or None if unavailable."""
+        
+       
+        mat = getattr(tracker, "warp", None)
+        if mat is not None and isinstance(mat, np.ndarray):
+            return mat.copy()
+        return None
+
     @QtCore.Slot()
     def run(self):
         try:
@@ -359,9 +384,13 @@ class TrackingStepWorker(QtCore.QObject):
                     det_aabbs = np.empty((0, 6), dtype=np.float32)
                 tracks = self.tracker.update(det_aabbs, frame)
                 obbs = self._assign_ids(obbs, det_aabbs, tracks)
+                # ── Trajectories from tracker internal STracks ──
                 snap = extract_trajectories_from_tracker(self.tracker)
+                # ── Extract CMC warp matrix (affine 2×3 or homography 3×3) ──
+                warp = self._extract_cmc_matrix(self.tracker)
                 self.frame_tracked.emit(idx, obbs)
                 self.traj_snapshot.emit(idx, snap)
+                self.cmc_snapshot.emit(idx, warp)
                 self.progress.emit(i + 1, total)
             self.finished.emit()
         except Exception as e:
@@ -470,6 +499,7 @@ class TrackingPage(QtWidgets.QWidget):
         self.last_tracked_idx: int = -1
         self.track_cache: Dict[int, List[OBBOX]] = {}
         self.traj_snapshots: Dict[int, Dict[int, List[Tuple[float, float]]]] = {}
+        self.cmc_cache: Dict[int, Optional[np.ndarray]] = {}   # frame → affine 2×3 or 3×3
 
         self.selected_idx: Optional[int] = None
         self.draw_map: Dict[str, float] = {"scale": 1.0, "xoff": 0, "yoff": 0}
@@ -902,6 +932,7 @@ class TrackingPage(QtWidgets.QWidget):
         self.last_tracked_idx = -1
         self.track_cache.clear()
         self.traj_snapshots.clear()
+        self.cmc_cache.clear()
         self.selected_idx = None
         self._pending_id_changes.clear()
         self._update_step_btn()
@@ -967,6 +998,7 @@ class TrackingPage(QtWidgets.QWidget):
         self._wt.started.connect(self._wk.run)
         self._wk.frame_tracked.connect(self._on_frame_tracked)
         self._wk.traj_snapshot.connect(self._on_traj_snapshot)
+        self._wk.cmc_snapshot.connect(self._on_cmc_snapshot)
         self._wk.progress.connect(self._on_progress)
         self._wk.finished.connect(self._on_done)
         self._wk.error.connect(self._on_error)
@@ -986,6 +1018,12 @@ class TrackingPage(QtWidgets.QWidget):
         self.traj_snapshots[idx] = dict(snap)
         if idx == self.current_idx:
             self._redraw()
+
+    def _on_cmc_snapshot(self, idx, warp):
+        if warp is not None:
+            self.cmc_cache[idx] = np.asarray(warp, dtype=np.float64)
+        else:
+            self.cmc_cache[idx] = None
 
     def _on_progress(self, done, total):
         pct = int(done / max(total, 1) * 100)
@@ -1101,6 +1139,19 @@ class TrackingPage(QtWidgets.QWidget):
         pf_dir.mkdir(parents=True, exist_ok=True)
         pt_dir.mkdir(parents=True, exist_ok=True)
 
+        # ── Export CMC affine matrices (frame-to-frame warp) ──
+        cmc_out: Dict[str, Any] = {}
+        for fidx in sorted(self.cmc_cache.keys()):
+            mat = self.cmc_cache[fidx]
+            if mat is not None:
+                cmc_out[str(fidx)] = mat.tolist()
+            else:
+                cmc_out[str(fidx)] = None
+        if cmc_out:
+            cmc_path = Path(out_dir) / "cmc_transforms.json"
+            cmc_path.write_text(
+                json.dumps(cmc_out, indent=2, ensure_ascii=False))
+
         # Collect per-track data while writing per-frame files
         per_track: Dict[int, list] = defaultdict(list)
         n_frames = 0
@@ -1136,6 +1187,13 @@ class TrackingPage(QtWidgets.QWidget):
                 )
                 lines.append(line)
 
+                # ── Compute OBB parametric form (cx, cy, w, h, angle) ──
+                obb_xywhr = obb_to_xywhr(b.poly)
+
+                # ── CMC warp matrix for this frame (if available) ──
+                frame_cmc = self.cmc_cache.get(frame_idx)
+                cmc_entry = frame_cmc.tolist() if frame_cmc is not None else None
+
                 # Accumulate for per_track
                 per_track[b.track_id].append({
                     "frame": frame_idx,
@@ -1144,6 +1202,14 @@ class TrackingPage(QtWidgets.QWidget):
                              round(bx2, 2), round(by2, 2)],
                     "obb": [[round(float(pts[i, 0]), 2),
                              round(float(pts[i, 1]), 2)] for i in range(4)],
+                    "obb_xywhr": {
+                        "cx": obb_xywhr[0],
+                        "cy": obb_xywhr[1],
+                        "width": obb_xywhr[2],
+                        "height": obb_xywhr[3],
+                        "angle_deg": obb_xywhr[4],
+                    },
+                    "cmc_affine": cmc_entry,
                     "confidence": round(b.conf, 4),
                     "class_id": b.cls_id,
                 })
@@ -1167,14 +1233,16 @@ class TrackingPage(QtWidgets.QWidget):
                 json.dumps(record, indent=2, ensure_ascii=False))
 
         n_tracks = len(per_track)
+        n_cmc = sum(1 for v in self.cmc_cache.values() if v is not None)
         self._status(
             f"Exported {n_detections} detections across {n_frames} frames, "
-            f"{n_tracks} tracks → {out_dir}")
+            f"{n_tracks} tracks, {n_cmc} CMC matrices → {out_dir}")
         QtWidgets.QMessageBox.information(
             self, "Data export complete",
             f"Exported to: {out_dir}\n\n"
             f"per_frame/  → {n_frames} files\n"
             f"per_track/  → {n_tracks} JSON files\n"
+            f"cmc_transforms.json → {n_cmc} matrices\n"
             f"Total detections: {n_detections}",
         )
 
