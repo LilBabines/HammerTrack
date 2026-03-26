@@ -1,2 +1,62 @@
-ffmpeg -ss 00:04:00 -to 00:08:00 -i /mnt/sda2/HAMMER/data/SIMP1920/SIMP1920_122.mp4 -c:v libx264 -crf 18 SIMP1920_122-04-08.mp4
+ffmpeg -ss 00:01:10 -to 00:02:00 -i /home/auguste/Downloads/transfer_12221686_files_dbbda35b/20260223-214150_yolo_record_1920x1080.mkv -c:v libx264 -crf 18 /home/auguste/Downloads/transfer_12221686_files_dbbda35b/clips/20260223-214150_yolo_record_1920x1080_1-10_2-00.mkv
 
+ffmpeg -ss 00:00:10 -to 00:01:20 -i /home/auguste/Downloads/transfer_12221686_files_dbbda35b/DJI_20260226134316_0001_V.MP4 -c:v libx264 -crf 18 /home/auguste/Downloads/transfer_12221686_files_dbbda35b/DJI_20260226134316_0001_V_00-10_01-20.MP4
+
+
+
+python angle_render.py clips/selected/SIMP2021_114-00-08_06.mp4 \
+/home/auguste/Desktop/HammerTrack/projects/hammer/exports/2021_114/postp_tracks/*.json \
+--cmc projects/hammer/exports/2021_114/cmc_transforms.json \
+-o projects/hammer/exports/2021_114/output_angle_good_interpol.mp4
+
+
+
+    groups = [
+        [2, 34, 40],
+        [7, 32],
+        [10, 15],
+        [85],
+        [65],
+        [11],
+        [17],
+        [57],
+        [65],
+        [100],
+        [113],
+        [115],
+        [116],
+        [117]
+    ]
+
+
+    groups = [
+        [2],
+        [6],
+        [1, 132],
+        [19, 48, 72, 136],
+        [139, 242, 413],
+        [3, 50],
+        [12, 177, 243, 256],
+        [5, 77],
+        [13, 116, 155],
+        [18, 161, 186, 301, 332, 348, 384, 416, 477],
+        [10],
+        [9, 120],
+        [25, 78],
+        [31],
+        [23, 306, 361, 615],
+        [17, 73, 231, 259, 281, 309, 412],
+        [11],
+        [7,  105, 125, 185, 246],
+        [16, 47, 57, 82, 98, 107, 112, 152, 352, 631],
+        [28,60],
+        [24,51,63,67,121,128,133,142,168,252,275,364,365],
+        [241,438],
+        [212,395],
+        [213,380,388,425,474],
+        [38],
+        [4,70,88],
+        [40],
+        [151,270]
+        [15,89,106]
+    ]

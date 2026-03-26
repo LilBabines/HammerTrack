@@ -1,6 +1,6 @@
 """
 Post-processing pipeline for object tracker outputs.
-- Merge multiple tracks (same individual)
+- Merge multiple tracks (same individual) — Kalman-tail aware
 - Deduplicate frames (keep highest confidence)
 - Remove outlier detections
 - Smooth centroids (Savitzky-Golay or moving average)
@@ -10,9 +10,11 @@ Post-processing pipeline for object tracker outputs.
 import json
 import glob
 import numpy as np
+import cv2
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
+from collections import defaultdict
 
 
 @dataclass
@@ -43,20 +45,50 @@ def load_tracks(pattern: str) -> list[dict]:
     return tracks
 
 
-def merge_tracks(tracks: list[dict], track_ids: list[int] | None = None) -> MergedTrack:
+def merge_tracks(
+    tracks: list[dict],
+    track_ids: list[int] | None = None,
+    cum_affines: dict[int, np.ndarray] | None = None,
+) -> MergedTrack:
     """
-    Merge multiple track JSONs into one.
-    If track_ids is None, merge ALL tracks.
-    For duplicate frames, keep the detection with highest confidence.
+    Merge multiple track JSONs into one, processed **in order** of track_ids.
+
+    If cum_affines is provided, gap interpolation is done in ref space
+    (frame 0) so that camera motion doesn't corrupt interpolated centroids.
     """
     if track_ids is None:
         track_ids = [t["track_id"] for t in tracks]
 
-    selected = [t for t in tracks if t["track_id"] in track_ids]
+    track_by_id = {t["track_id"]: t for t in tracks}
+    selected = [track_by_id[tid] for tid in track_ids if tid in track_by_id]
+
     merged = MergedTrack(track_ids=track_ids)
 
-    for track in selected:
-        for det in track["detections"]:
+    for idx, track in enumerate(selected):
+        dets = sorted(track["detections"], key=lambda d: d["frame"])
+        if not dets:
+            continue
+
+        real_frames = [d["frame"] for d in dets if d.get("obb") is not None]
+        if not real_frames:
+            continue
+
+        last_real_frame = max(real_frames)
+
+        next_first_frame = None
+        if idx + 1 < len(selected):
+            next_dets = selected[idx + 1]["detections"]
+            if next_dets:
+                next_first_frame = min(d["frame"] for d in next_dets)
+
+        if next_first_frame is not None:
+            cut_frame = min(last_real_frame, next_first_frame - 1)
+        else:
+            cut_frame = last_real_frame
+
+        for det in dets:
+            if det["frame"] > cut_frame:
+                break
             d = Detection(
                 frame=det["frame"],
                 centroid=det["centroid"],
@@ -66,10 +98,60 @@ def merge_tracks(tracks: list[dict], track_ids: list[int] | None = None) -> Merg
                 obb=det.get("obb"),
                 source_track_id=track["track_id"],
             )
-            f = d.frame
-            # Keep best confidence for duplicate frames
-            if f not in merged.detections or d.confidence > merged.detections[f].confidence:
-                merged.detections[f] = d
+            if d.frame not in merged.detections or d.confidence > merged.detections[d.frame].confidence:
+                merged.detections[d.frame] = d
+
+        # --- Interpolation du gap vers la track suivante ----------------
+        if next_first_frame is not None and next_first_frame > cut_frame + 1:
+            anchor = None
+            for det in reversed(dets):
+                if det["frame"] <= cut_frame and det.get("obb") is not None:
+                    anchor = det
+                    break
+            if anchor is None:
+                continue
+
+            next_det = min(
+                selected[idx + 1]["detections"], key=lambda d: d["frame"]
+            )
+
+            f0 = anchor["frame"]
+            f1 = next_det["frame"]
+            span = f1 - f0 if f1 != f0 else 1
+
+            use_cmc = (
+                cum_affines is not None
+                and f0 in cum_affines
+                and f1 in cum_affines
+            )
+
+            if use_cmc:
+                c0 = warp_point_to_ref(anchor["centroid"], cum_affines[f0])
+                c1 = warp_point_to_ref(next_det["centroid"], cum_affines[f1])
+            else:
+                c0 = np.array(anchor["centroid"])
+                c1 = np.array(next_det["centroid"])
+
+            for f in range(cut_frame + 1, next_first_frame):
+                if f in merged.detections:
+                    continue
+                t = (f - f0) / span
+                c_ref = c0 + t * (c1 - c0)
+
+                if use_cmc and f in cum_affines:
+                    centroid = warp_point_from_ref(c_ref, cum_affines[f]).tolist()
+                else:
+                    centroid = c_ref.tolist()
+
+                merged.detections[f] = Detection(
+                    frame=f,
+                    centroid=centroid,
+                    bbox=list(anchor["bbox"]),
+                    confidence=0.0,
+                    class_id=anchor["class_id"],
+                    obb=None,
+                    source_track_id=None,
+                )
 
     return merged
 
@@ -82,15 +164,6 @@ def remove_outliers(
     z_threshold: float = 3.0,
     method: str = "jump",
 ) -> MergedTrack:
-    """
-    Remove outlier detections.
-
-    Methods:
-      - 'jump':  remove points where the displacement from the previous
-                 frame exceeds max_jump_px.
-      - 'zscore': remove points whose frame-to-frame displacement is
-                  > z_threshold standard deviations from the mean.
-    """
     frames_sorted = sorted(merged.detections.keys())
     if len(frames_sorted) < 3:
         return merged
@@ -127,16 +200,9 @@ def smooth_centroids(
     window: int = 5,
     polyorder: int = 2,
 ) -> MergedTrack:
-    """
-    Smooth centroid positions.
-
-    Methods:
-      - 'savgol':  Savitzky-Golay filter (needs scipy)
-      - 'moving_avg': simple moving average (no extra deps)
-    """
     frames_sorted = sorted(merged.detections.keys())
     if len(frames_sorted) < window:
-        return merged  # not enough points
+        return merged
 
     centroids = np.array([merged.detections[f].centroid for f in frames_sorted])
 
@@ -169,13 +235,11 @@ def smooth_centroids(
 def interpolate_missing(
     merged: MergedTrack,
     method: str = "linear",
+    cum_affines: dict[int, np.ndarray] | None = None,
 ) -> MergedTrack:
     """
     Fill in missing frames between first and last detection.
-    Interpolates centroid and bbox. Confidence is set to 0 for
-    interpolated frames.
-
-    Methods: 'linear', 'cubic' (cubic needs scipy).
+    If cum_affines is provided, interpolation is done in ref space.
     """
     frames_sorted = sorted(merged.detections.keys())
     if len(frames_sorted) < 2:
@@ -188,7 +252,19 @@ def interpolate_missing(
     if not missing:
         return merged
 
-    centroids = np.array([merged.detections[f].centroid for f in frames_sorted])
+    use_cmc = (
+        cum_affines is not None
+        and all(f in cum_affines for f in frames_sorted)
+    )
+
+    if use_cmc:
+        centroids = np.array([
+            warp_point_to_ref(merged.detections[f].centroid, cum_affines[f])
+            for f in frames_sorted
+        ])
+    else:
+        centroids = np.array([merged.detections[f].centroid for f in frames_sorted])
+
     bboxes = np.array([merged.detections[f].bbox for f in frames_sorted])
     frames_arr = np.array(frames_sorted, dtype=float)
     missing_arr = np.array(sorted(missing), dtype=float)
@@ -215,11 +291,19 @@ def interpolate_missing(
     class_id = merged.detections[frames_sorted[0]].class_id
 
     for i, f in enumerate(missing_arr.astype(int)):
-        merged.detections[int(f)] = Detection(
-            frame=int(f),
-            centroid=[float(interp_cx[i]), float(interp_cy[i])],
+        f = int(f)
+        c_ref = np.array([float(interp_cx[i]), float(interp_cy[i])])
+
+        if use_cmc and f in cum_affines:
+            c_img = warp_point_from_ref(c_ref, cum_affines[f])
+        else:
+            c_img = c_ref
+
+        merged.detections[f] = Detection(
+            frame=f,
+            centroid=c_img.tolist(),
             bbox=interp_bbox[i].tolist(),
-            confidence=0.0,  # flag as interpolated
+            confidence=0.0,
             class_id=class_id,
             source_track_id=None,
         )
@@ -230,7 +314,6 @@ def interpolate_missing(
 # ── 5. Export ────────────────────────────────────────────────────────
 
 def export_merged(merged: MergedTrack, output_path: str):
-    """Export the merged + processed track to JSON."""
     frames_sorted = sorted(merged.detections.keys())
     detections = []
     for f in frames_sorted:
@@ -260,38 +343,249 @@ def export_merged(merged: MergedTrack, output_path: str):
     print(f"Exported {len(detections)} detections to {output_path}")
 
 
+# ── 6. Visualization ─────────────────────────────────────────────────
+
+TRACK_COLORS = [
+    (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0),
+    (255, 0, 255), (0, 255, 255), (128, 0, 255), (255, 128, 0),
+    (0, 128, 255), (128, 255, 0), (255, 0, 128), (0, 255, 128),
+    (200, 200, 0), (200, 0, 200), (0, 200, 200), (100, 100, 255),
+    (255, 100, 100), (100, 255, 100),
+]
+
+
+def render_tracks_on_video(
+    video_path: str,
+    all_merged: list[tuple[list[int], MergedTrack]],
+    output_path: str,
+    trail_length: int = 30,
+    draw_bbox: bool = True,
+    draw_obb: bool = True,
+    draw_centroid: bool = True,
+    draw_trail: bool = True,
+    draw_label: bool = True,
+    codec: str = "mp4v",
+):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Cannot open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    fourcc = cv2.VideoWriter_fourcc(*codec)
+    out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+    frame_index: dict[int, list[tuple[int, Detection]]] = defaultdict(list)
+    for tidx, (group, merged) in enumerate(all_merged):
+        for f, det in merged.detections.items():
+            frame_index[f].append((tidx, det))
+
+    print(f"Rendering {total_frames} frames → {output_path}")
+
+    trails: dict[int, list[tuple[int, int]]] = defaultdict(list)
+
+    frame_num = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        entries = frame_index.get(frame_num, [])
+
+        for tidx, det in entries:
+            color = TRACK_COLORS[tidx % len(TRACK_COLORS)]
+            is_interp = det.confidence == 0.0
+            cx, cy = int(det.centroid[0]), int(det.centroid[1])
+
+            trails[tidx].append((cx, cy))
+            if len(trails[tidx]) > trail_length:
+                trails[tidx] = trails[tidx][-trail_length:]
+
+            if draw_trail and len(trails[tidx]) > 1:
+                pts = trails[tidx]
+                for i in range(1, len(pts)):
+                    alpha = i / len(pts)
+                    thick = max(1, int(alpha * 3))
+                    cv2.line(frame, pts[i - 1], pts[i], color, thick, cv2.LINE_AA)
+
+            if draw_bbox and det.bbox:
+                b = det.bbox
+                if len(b) == 4:
+                    x1, y1, x2, y2 = map(int, b)
+                    if is_interp:
+                        _draw_dashed_rect(frame, (x1, y1), (x2, y2), color, 1, 8)
+                    else:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+
+            if draw_obb and det.obb is not None and len(det.obb) >= 4:
+                pts_obb = np.array(det.obb, dtype=np.float32)
+                if pts_obb.ndim == 2 and pts_obb.shape[0] >= 4:
+                    pts_int = pts_obb[:4].astype(np.int32)
+                    cv2.polylines(frame, [pts_int], True, color, 2, cv2.LINE_AA)
+
+            if draw_centroid:
+                radius = 3 if is_interp else 5
+                cv2.circle(frame, (cx, cy), radius, color, -1, cv2.LINE_AA)
+
+            if draw_label:
+                group_ids = all_merged[tidx][0]
+                label = f"ID {group_ids[0]}"
+                if is_interp:
+                    label += " (interp)"
+                cv2.putText(
+                    frame, label,
+                    (cx + 8, cy - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA,
+                )
+
+        out.write(frame)
+        frame_num += 1
+
+        if frame_num % 500 == 0:
+            print(f"  {frame_num}/{total_frames} frames rendered")
+
+    cap.release()
+    out.release()
+    print(f"Done. Output: {output_path}")
+
+
+def _draw_dashed_rect(img, pt1, pt2, color, thickness=1, dash_len=8):
+    edges = [
+        (pt1, (pt2[0], pt1[1])),
+        ((pt2[0], pt1[1]), pt2),
+        (pt2, (pt1[0], pt2[1])),
+        ((pt1[0], pt2[1]), pt1),
+    ]
+    for (x1, y1), (x2, y2) in edges:
+        dist = int(np.hypot(x2 - x1, y2 - y1))
+        if dist == 0:
+            continue
+        dx, dy = (x2 - x1) / dist, (y2 - y1) / dist
+        for i in range(0, dist, dash_len * 2):
+            s = i
+            e = min(i + dash_len, dist)
+            sp = (int(x1 + dx * s), int(y1 + dy * s))
+            ep = (int(x1 + dx * e), int(y1 + dy * e))
+            cv2.line(img, sp, ep, color, thickness, cv2.LINE_AA)
+
+
+# ── CMC helpers ──────────────────────────────────────────────────────
+
+def build_cum_affine(cmc, start, end):
+    """
+    cum[f] = 2×3 affine:  ref (frame start) → frame f.
+    To warp a point from frame f to ref: use the inverse.
+    """
+    cum = {}
+    M_acc = np.eye(3, dtype=np.float64)
+    for f in range(start, end):
+        fk = str(f)
+        if fk in cmc:
+            A = np.eye(3, dtype=np.float64)
+            A[:2, :] = np.array(cmc[fk])
+            M_acc = A @ M_acc
+        cum[f] = M_acc[:2, :].copy()
+    return cum
+
+
+def warp_point_to_ref(pt, cum_affine_f):
+    """Frame f image-space → ref space (inverse of cum_affine_f)."""
+    A = np.eye(3, dtype=np.float64)
+    A[:2, :] = cum_affine_f
+    A_inv = np.linalg.inv(A)
+    p = A_inv @ np.array([pt[0], pt[1], 1.0])
+    return p[:2]
+
+
+def warp_point_from_ref(pt, cum_affine_f):
+    """Ref space → frame f image-space (forward of cum_affine_f)."""
+    A = cum_affine_f  # 2×3
+    return A @ np.array([pt[0], pt[1], 1.0])
+
+
 # ── Usage Example ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # 0. Load CMC & build cumulative affines
+    with open("projects/hammer/exports/2021_114/cmc_transforms.json") as f:
+        cmc = json.load(f)
+    cum_affines = build_cum_affine(cmc, start=0, end=20000)
+
     # 1. Load all tracks
-    tracks = load_tracks("projects/hammer/exports/per_track/track_*.json")
+    tracks = load_tracks("projects/hammer/exports/2021_114/per_track/track_*.json")
 
     # 2. Define which tracks to merge (same individual)
-    #    e.g. tracks 1, 5 and 12 are the same person
     groups = [
-        [2, 34, 40],
-        [7, 32],
-        [10, 15],
-        [85],
-        [65]
+        [2],
+        [6],
+        [1, 132],
+        [19, 48, 72, 136],
+        [139, 242, 413],
+        [3, 50],
+        [12, 177, 243, 256],
+        [5, 77],
+        [13, 116, 155],
+        [18, 161, 186, 301, 332, 348, 384, 416, 477],
+        [10],
+        [9, 120],
+        [25, 78],
+        [31],
+        [23, 306, 361, 615],
+        [17, 73, 231, 259, 281, 309, 412],
+        [11],
+        [7,  105, 125, 185, 246],
+        [16, 47, 57, 82, 98, 107, 112, 152, 352, 631],
+        [28,60],
+        [24,51,63,67,121,128,133,142,168,252,275,364,365],
+        [241,438],
+        [212,395],
+        [213,380,388,425,474],
+        [38],
+        [4,70,88],
+        [40],
+        [151,270],
+        [15,89,106]
     ]
 
+    all_merged: list[tuple[list[int], MergedTrack]] = []
+
     for group in groups:
-        # Merge
-        merged = merge_tracks(tracks, track_ids=group)
+        if not group:
+            continue
+
+        # Merge (Kalman-tail aware, CMC-aware gap interpolation)
+        merged = merge_tracks(tracks, track_ids=group, cum_affines=cum_affines)
         print(f"Track group {group}: {len(merged.detections)} detections after merge")
 
         # Remove outliers
         merged = remove_outliers(merged, max_jump_px=150, method="jump")
         print(f"  After outlier removal: {len(merged.detections)}")
 
-        # Interpolate missing frames
-        merged = interpolate_missing(merged, method="linear")
+        # Interpolate remaining missing frames (CMC-aware)
+        merged = interpolate_missing(merged, method="linear", cum_affines=cum_affines)
         print(f"  After interpolation: {len(merged.detections)}")
 
         # Smooth
         merged = smooth_centroids(merged, method="savgol", window=7, polyorder=2)
 
-        # Export
+        # Export JSON
         tag = "_".join(str(i) for i in group)
-        export_merged(merged, f"projects/hammer/exports/track_postprocessed/merged_{tag}.json")
+        export_merged(merged, f"projects/hammer/exports/2021_114/postp_tracks/merged_{tag}.json")
+
+        all_merged.append((group, merged))
+
+    # # 3. Render toutes les tracks sur la vidéo
+    # render_tracks_on_video(
+    #     video_path="clips/selected/SIMP2021_114-00-08_06.mp4",
+    #     all_merged=all_merged,
+    #     output_path="projects/hammer/exports/2021_114/postp_tracks/overlay.mp4",
+    #     trail_length=200,
+    #     draw_bbox=False,
+    #     draw_obb=True,
+    #     draw_centroid=True,
+    #     draw_trail=True,
+    #     draw_label=False,
+    # )
