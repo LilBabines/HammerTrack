@@ -228,9 +228,9 @@ def draw_tracked_annotations(
         tid = b.track_id
 
         if selected_idx is not None and i == selected_idx:
-            color, thick = (255, 0, 255), 3
+            color, thick = (255, 0, 255), 5
         else:
-            color, thick = track_color(tid), 2
+            color, thick = track_color(tid), 4
 
         cv2.polylines(out, [pts], True, color, thick, cv2.LINE_AA)
 

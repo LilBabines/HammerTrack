@@ -172,13 +172,13 @@ def draw_annotations(
         # Color scheme: green=verified, orange=unverified, magenta=selected
         if selected_idx is not None and i == selected_idx:
             color = (255, 0, 255)          # magenta highlight
-            thick = 2
+            thick = 4
         elif b.verified:
             color = (0, 255, 0)            # green
-            thick = 2
+            thick = 4
         else:
             color = (0, 200, 255)          # orange
-            thick = 2
+            thick = 4
 
         # Draw polygon outline
         cv2.polylines(out, [pts], isClosed=True, color=color, thickness=thick)
