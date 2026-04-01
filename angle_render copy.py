@@ -1,18 +1,13 @@
 """
-Render OBB + cohesion + compass on video.
+Render OBB + compass on video.
 
-Angle computation (image space):
+All angle computation in IMAGE SPACE:
   1. CMC-warped trail → trajectory direction
   2. OBB long axis smoothed (×2 trick, π-periodic)
   3. Disambiguate axis with trail direction → directed angle
-  4. Local ±π fix: EMA + trajectory blend (no cumulative offset)
+  4. Fix ±180° jumps from bad CMC frames
   5. Arrow on video = angle_img
   6. Compass = angle_img - cum_rot - ref
-
-Cohesion (per frame, independent):
-  T(t) = median bbox diagonal at frame t
-  cohesion_i(t) = median(dist(i,j) for j present at t) / T(t)
-  cohesion_global(t) = mean(cohesion_i(t))
 """
 
 import os
@@ -21,7 +16,6 @@ import cv2
 import json
 import argparse
 import numpy as np
-import pandas as pd
 from collections import defaultdict
 from scipy.signal import savgol_filter
 
@@ -70,19 +64,6 @@ def disambiguate(axis_angle, direction):
     return (best + np.pi) % (2 * np.pi) - np.pi
 
 
-def circular_mean(angles):
-    """Circular mean of a list of angles."""
-    return np.arctan2(np.mean(np.sin(angles)), np.mean(np.cos(angles)))
-
-
-def circular_blend(a, b, alpha):
-    """Blend angle a (weight alpha) with angle b (weight 1-alpha)."""
-    return np.arctan2(
-        alpha * np.sin(a) + (1 - alpha) * np.sin(b),
-        alpha * np.cos(a) + (1 - alpha) * np.cos(b),
-    )
-
-
 # ── Savgol ───────────────────────────────────────────────────────────
 
 def _sw(n, w, p):
@@ -109,87 +90,45 @@ def smooth_dir(a, w=51, p=2):
     return (s + np.pi) % (2 * np.pi) - np.pi
 
 
-# ── Fix ±180° — local EMA, no cumulative offset ─────────────────────
+# ── Fix ±180° jumps ─────────────────────────────────────────────────
 
-def fix_pi_jumps_local(angle_abs, traj_dir_abs, ema_alpha=0.85, traj_weight=0.3):
+def fix_pi_jumps(angle_abs, threshold_deg=135):
     """
-    Fix ±π ambiguity locally at each frame using:
-      - an exponential moving average (EMA) of recent valid angles
-      - the trajectory direction as a secondary hint
+    Remove spurious ±180° flips in angle_abs caused by bad CMC frames.
 
-    For each frame, two candidates exist (angle and angle±π).
-    We pick whichever is closest to a blended reference of
-    EMA (continuity) and trajectory (physics).
+    A real shark doesn't turn >threshold_deg in a single frame, so any
+    consecutive jump above that threshold is assumed to be a π-ambiguity
+    error and is corrected by adding/subtracting π.
 
-    No cumulative offset → a single bad frame does NOT contaminate
-    the rest of the sequence.
+    Operates on the full array (with NaNs); only consecutive valid
+    entries are compared.
     """
     valid_idx = np.where(~np.isnan(angle_abs))[0]
     if len(valid_idx) < 2:
         return angle_abs
 
     fixed = angle_abs.copy()
-    ema = fixed[valid_idx[0]]
+    threshold = np.radians(threshold_deg)
+    offset = 0.0
 
     for k in range(1, len(valid_idx)):
-        i = valid_idx[k]
-        raw = fixed[i]
-        candidates = [raw, raw + np.pi, raw - np.pi]
+        i_prev = valid_idx[k - 1]
+        i_curr = valid_idx[k]
+        diff = angle_diff(fixed[i_curr] + offset, fixed[i_prev])
 
-        # Build reference: blend EMA with trajectory if available
-        traj = traj_dir_abs[i] if not np.isnan(traj_dir_abs[i]) else np.nan
-        if not np.isnan(traj):
-            ref = circular_blend(ema, traj, 1.0 - traj_weight)
-        else:
-            ref = ema
+        if abs(diff) > threshold:
+            # Jump is near ±π → false flip, correct it
+            if diff > 0:
+                offset -= np.pi
+            else:
+                offset += np.pi
 
-        # Pick candidate closest to reference
-        best = min(candidates, key=lambda c: abs(angle_diff(c, ref)))
-        fixed[i] = best
+        fixed[i_curr] += offset
 
-        # Update EMA
-        ema = circular_blend(ema, best, ema_alpha)
-
-    # ── Backward pass: same logic in reverse to catch early-sequence errors
-    ema = fixed[valid_idx[-1]]
-    fixed_bwd = fixed.copy()
-    for k in range(len(valid_idx) - 2, -1, -1):
-        i = valid_idx[k]
-        raw = fixed_bwd[i]
-        candidates = [raw, raw + np.pi, raw - np.pi]
-
-        traj = traj_dir_abs[i] if not np.isnan(traj_dir_abs[i]) else np.nan
-        if not np.isnan(traj):
-            ref = circular_blend(ema, traj, 1.0 - traj_weight)
-        else:
-            ref = ema
-
-        best = min(candidates, key=lambda c: abs(angle_diff(c, ref)))
-        fixed_bwd[i] = best
-        ema = circular_blend(ema, best, ema_alpha)
-
-    # ── Merge: for each frame, pick the candidate (fwd or bwd) closest to trajectory
-    merged = fixed.copy()
-    for k in range(len(valid_idx)):
-        i = valid_idx[k]
-        traj = traj_dir_abs[i] if not np.isnan(traj_dir_abs[i]) else np.nan
-        fwd_val = fixed[i]
-        bwd_val = fixed_bwd[i]
-
-        if abs(angle_diff(fwd_val, bwd_val)) < 0.1:
-            # Both agree
-            merged[i] = fwd_val
-        elif not np.isnan(traj):
-            # Pick whichever is closer to trajectory
-            merged[i] = min([fwd_val, bwd_val], key=lambda c: abs(angle_diff(c, traj)))
-        else:
-            # Default to forward pass
-            merged[i] = fwd_val
-
-    return merged
+    return fixed
 
 
-# ── Preprocess: smooth centroids ─────────────────────────────────────
+# ── Preprocess: smooth only ──────────────────────────────────────────
 
 def preprocess_track(track, sw, sp):
     dets = sorted(track["detections"], key=lambda d: d["frame"])
@@ -218,7 +157,6 @@ def compute_angles(track, cmc, cum_rot, trail_length, smooth_window, sw, sp, n_r
     n = len(dets)
     frames = [d["frame"] for d in dets]
 
-    # ── Trajectory direction in image space (from CMC-warped trail)
     trail = []
     traj_dir_img = np.full(n, np.nan)
 
@@ -241,7 +179,6 @@ def compute_angles(track, cmc, cum_rot, trail_length, smooth_window, sw, sp, n_r
             if np.linalg.norm(delta) > 1e-3:
                 traj_dir_img[i] = np.arctan2(delta[1], delta[0])
 
-    # ── OBB axis (π-periodic, smoothed)
     axis_img = np.full(n, np.nan)
     obb_mask = np.zeros(n, dtype=bool)
     for i, det in enumerate(dets):
@@ -259,7 +196,6 @@ def compute_angles(track, cmc, cum_rot, trail_length, smooth_window, sw, sp, n_r
     axis_lut = {int(obb_idx[k]): float(sm_axis[k]) for k in range(len(obb_idx))}
     traj_lut = {int(traj_idx[k]): float(sm_traj[k]) for k in range(len(traj_idx))}
 
-    # ── Initial disambiguation: axis + trajectory
     angle_img_result = np.full(n, np.nan)
     prev_dir = None
 
@@ -280,20 +216,16 @@ def compute_angles(track, cmc, cum_rot, trail_length, smooth_window, sw, sp, n_r
         elif prev_dir is not None:
             angle_img_result[i] = prev_dir
 
-    # ── angle_abs = directed angle in stabilized space
+    # angle_abs = directed angle in stabilized (absolute) space
     angle_abs = np.full(n, np.nan)
-    traj_dir_abs = np.full(n, np.nan)
     for i in range(n):
-        cr = cum_rot.get(frames[i], 0.0)
         if not np.isnan(angle_img_result[i]):
-            angle_abs[i] = angle_img_result[i] - cr
-        if not np.isnan(traj_dir_img[i]):
-            traj_dir_abs[i] = traj_dir_img[i] - cr
+            angle_abs[i] = angle_img_result[i] - cum_rot.get(frames[i], 0.0)
 
-    # ── Local ±π fix (forward+backward EMA, no cumulative offset)
-    angle_abs = fix_pi_jumps_local(angle_abs, traj_dir_abs)
+    # Fix ±180° jumps from bad CMC frames
+    angle_abs = fix_pi_jumps(angle_abs)
 
-    # ── Recompute angle_img from fixed angle_abs
+    # Also fix angle_img consistently: recompute from fixed angle_abs
     for i in range(n):
         if not np.isnan(angle_abs[i]):
             angle_img_result[i] = angle_abs[i] + cum_rot.get(frames[i], 0.0)
@@ -309,6 +241,11 @@ def compute_angles(track, cmc, cum_rot, trail_length, smooth_window, sw, sp, n_r
 
 
 def compute_group_ref_and_deltas(angles: dict, n_ref_frames: int):
+    """
+    Compute a single group reference angle from the first n_ref_frames
+    of the video (across ALL tracks), then set delta_abs for each track
+    relative to that group reference.
+    """
     all_first_frames = []
     for ti, ad in angles.items():
         valid = np.where(~np.isnan(ad["angle_abs"]))[0]
@@ -328,73 +265,25 @@ def compute_group_ref_and_deltas(angles: dict, n_ref_frames: int):
             if not np.isnan(ad["angle_abs"][i]):
                 ref_values.append(ad["angle_abs"][i])
 
-    group_ref = circular_mean(ref_values) if ref_values else 0.0
+    if not ref_values:
+        group_ref = 0.0
+    else:
+        rv = np.array(ref_values)
+        group_ref = np.arctan2(np.mean(np.sin(rv)), np.mean(np.cos(rv)))
 
     for ti, ad in angles.items():
         n = len(ad["angle_abs"])
         delta = np.full(n, np.nan)
         for i in range(n):
             if not np.isnan(ad["angle_abs"][i]):
-                delta[i] = angle_diff(ad["angle_abs"][i], group_ref)
+                delta[i] = (ad["angle_abs"][i] - group_ref + np.pi) % (2 * np.pi) - np.pi
         ad["delta_abs"] = delta
         ad["ref_angle"] = group_ref
 
     return group_ref
 
 
-# ── Cohesion (loaded from precomputed CSV) ───────────────────────────
-
-def bbox_diagonal(bbox):
-    w = bbox[2] - bbox[0]
-    h = bbox[3] - bbox[1]
-    return np.sqrt(w**2 + h**2)
-
-
-def load_cohesion_csv(csv_path):
-    """
-    Load cohesion CSV (one row per frame) produced by the cohesion script.
-    Returns a dict: {frame: (T, {track_id: cohesion_i}, cohesion_global)}
-    """
-    df = pd.read_csv(csv_path)
-    cohesion_lut = {}
-
-    # Detect cohesion_* columns → extract track ids
-    coh_cols = [c for c in df.columns if c.startswith("cohesion_") and c != "cohesion_globale"]
-    # track ids from column names: "cohesion_3" → 3
-    tid_map = {}
-    for c in coh_cols:
-        tid_str = c.replace("cohesion_", "")
-        try:
-            tid_map[c] = int(tid_str)
-        except ValueError:
-            tid_map[c] = tid_str
-
-    for _, row in df.iterrows():
-        f = int(row["frame"])
-        T_val = row.get("T", None)
-        if pd.isna(T_val):
-            T_val = None
-        else:
-            T_val = float(T_val)
-
-        coh_per = {}
-        for c, tid in tid_map.items():
-            v = row.get(c, None)
-            if pd.notna(v):
-                coh_per[tid] = float(v)
-
-        coh_global = row.get("cohesion_globale", None)
-        if pd.isna(coh_global):
-            coh_global = None
-        else:
-            coh_global = float(coh_global)
-
-        cohesion_lut[f] = (T_val, coh_per, coh_global)
-
-    return cohesion_lut
-
-
-# ── Drawing helpers ──────────────────────────────────────────────────
+# ── Drawing ──────────────────────────────────────────────────────────
 
 PALETTE = [
     (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0),
@@ -433,23 +322,16 @@ def draw_arrow(fr, c, angle, col, length=50, th=2):
 
 # ── Panel ────────────────────────────────────────────────────────────
 
-def draw_panel(ph, pw, infos, full_trails, display_trails, cohesion_data, tl=40):
-    """
-    Panel layout (top to bottom):
-      - Trajectories     (~40%)
-      - Cohesion         (~20%)
-      - Compass          (~40%)
-    """
+def draw_panel(ph, pw, infos, full_trails, display_trails, tl=40):
     panel = np.zeros((ph, pw, 3), dtype=np.uint8)
     n = len(infos)
+    if n == 0:
+        return panel
 
-    traj_h = int(ph * 0.40)
-    cohe_h = int(ph * 0.20)
-    comp_h = ph - traj_h - cohe_h
+    th = ph // 2
+    bh = ph - th
 
-    # ══════════════════════════════════════════════════════════════════
-    # TOP: Stabilized trajectories
-    # ══════════════════════════════════════════════════════════════════
+    # ── Top section: full trajectory history (orthonormal) ───────────
     all_pts = []
     track_pts = {}
     active_tracks = {info["track_idx"] for info in infos}
@@ -460,14 +342,21 @@ def draw_panel(ph, pw, infos, full_trails, display_trails, cohesion_data, tl=40)
 
     if len(all_pts) >= 2:
         anp = np.array(all_pts)
-        mn, mx = anp.min(axis=0), anp.max(axis=0)
+        mn = anp.min(axis=0)
+        mx = anp.max(axis=0)
         span = mx - mn
+
         m = 12
-        draw_w, draw_h = pw - 2 * m, traj_h - 2 * m - 16
+        draw_w = pw - 2 * m
+        draw_h = th - 2 * m - 16
+
         sx = draw_w / max(span[0], 1e-3)
         sy = draw_h / max(span[1], 1e-3)
         sc = min(sx, sy)
-        used_w, used_h = span[0] * sc, span[1] * sc
+
+        used_w = span[0] * sc
+        used_h = span[1] * sc
+
         off_x = m + (draw_w - used_w) / 2.0
         off_y = m + 16 + (draw_h - used_h) / 2.0
 
@@ -482,77 +371,29 @@ def draw_panel(ph, pw, infos, full_trails, display_trails, cohesion_data, tl=40)
             col = get_color(t)
             npts = len(pts)
             is_active = t in active_tracks
+
             for j in range(1, npts):
                 alpha = 0.3 + 0.7 * (j / npts)
                 if not is_active:
                     alpha *= 0.5
                 c_fade = tuple(int(ch * alpha) for ch in col)
                 cv2.line(panel, tp(pts[j - 1]), tp(pts[j]), c_fade, 1)
+
             if is_active:
                 cv2.circle(panel, tp(pts[-1]), 6, col, -1)
             else:
                 cv2.circle(panel, tp(pts[-1]), 5, col, 1)
 
-    # Separator
-    cv2.line(panel, (0, traj_h), (pw, traj_h), (50, 50, 50), 2)
+    cv2.line(panel, (0, th), (pw, th), (50, 50, 50), 2)
 
-    # ══════════════════════════════════════════════════════════════════
-    # MIDDLE: Cohesion
-    # ══════════════════════════════════════════════════════════════════
-    y0 = traj_h
-    T_val, coh_per, coh_global = cohesion_data
-
-    cv2.putText(panel, "Cohesion", (4, y0 + 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
-
-    if coh_global is not None:
-        # ── Global value (large)
-        gtxt = f"{coh_global:.2f}"
-        cv2.putText(panel, gtxt, (pw // 2 - 30, y0 + 42),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-
-        if T_val is not None:
-            cv2.putText(panel, f"T={T_val:.0f}px  n={len(coh_per)}",
-                        (4, y0 + 44),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80, 80, 80), 1)
-
-        # ── Per-shark mini bars
-        bar_y = y0 + 56
-        bar_h = 8
-        max_bar_w = pw - 20
-        # Scale: cohesion=0 → full bar, cohesion=max_display → empty
-        max_display = max(coh_per.values()) * 1.2 if coh_per else 1.0
-        max_display = max(max_display, 0.01)
-
-        sorted_sharks = sorted(coh_per.items(), key=lambda x: x[0])
-        for ti, ci in sorted_sharks:
-            if bar_y + bar_h + 2 > y0 + cohe_h - 4:
-                break
-            col = get_color(ti)
-            bw = int((ci / max_display) * max_bar_w)
-            bw = max(bw, 2)
-            cv2.rectangle(panel, (10, bar_y), (10 + bw, bar_y + bar_h), col, -1)
-            cv2.putText(panel, f"{ci:.1f}", (14 + bw, bar_y + bar_h - 1),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.25, col, 1)
-            bar_y += bar_h + 3
-    else:
-        cv2.putText(panel, "N/A (<2 sharks)", (10, y0 + 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
-
-    # Separator
-    cv2.line(panel, (0, y0 + cohe_h), (pw, y0 + cohe_h), (50, 50, 50), 2)
-
-    # ══════════════════════════════════════════════════════════════════
-    # BOTTOM: Compass
-    # ══════════════════════════════════════════════════════════════════
-    comp_y0 = y0 + cohe_h
+    # ── Bottom section: single group compass ─────────────────────────
     cx = pw // 2
-    cy = comp_y0 + comp_h // 2
+    cy = th + bh // 2
     margin = 30
-    r = min(pw // 2 - margin, comp_h // 2 - margin)
+    r = min(pw // 2 - margin, bh // 2 - margin)
     r = max(r, 40)
 
-    cv2.putText(panel, "Group orientation", (4, comp_y0 + 16),
+    cv2.putText(panel, "Group orientation", (4, th + 16),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
 
     cv2.circle(panel, (cx, cy), r, (60, 60, 60), 1, cv2.LINE_AA)
@@ -584,10 +425,14 @@ def draw_panel(ph, pw, infos, full_trails, display_trails, cohesion_data, tl=40)
         cv2.arrowedLine(overlay, (cx, cy), (ax, ay), col, 2, tipLength=0.25)
 
     cv2.addWeighted(overlay, 0.5, panel, 0.5, 0, panel)
+
     cv2.circle(panel, (cx, cy), 3, (180, 180, 180), -1, cv2.LINE_AA)
 
     if valid_deltas:
-        mean_delta = circular_mean(valid_deltas)
+        sin_sum = sum(np.sin(d) for d in valid_deltas)
+        cos_sum = sum(np.cos(d) for d in valid_deltas)
+        mean_delta = np.arctan2(sin_sum, cos_sum)
+
         da_mean = -np.pi / 2 + mean_delta
         mx_a = int(cx + (r - 8) * np.cos(da_mean))
         my_a = int(cy + (r - 8) * np.sin(da_mean))
@@ -655,7 +500,7 @@ def build_frame_index(tracks):
 
 
 def render(
-    video_path, track_paths, cmc_path, cohesion_csv_path, output_path,
+    video_path, track_paths, cmc_path, output_path,
     trail_length=40, smooth_window=7,
     thickness=2, panel_width=300,
     codec="mp4v", start_frame=0, end_frame=None,
@@ -680,22 +525,6 @@ def render(
 
     fidx = build_frame_index(tracks)
     cum_rot = build_cum_rot(cmc, start_frame, end_frame)
-
-    print("Loading cohesion CSV...")
-    cohesion_lut_raw = load_cohesion_csv(cohesion_csv_path)
-    print(f"  {len(cohesion_lut_raw)} frames loaded from {cohesion_csv_path}")
-
-    # Map CSV track_ids (e.g. 3, 50) → render indices (0, 1, 2...)
-    tid_to_idx = {}
-    for ti, t in enumerate(tracks):
-        orig_id = t.get("merged_track_ids", [ti])[0]
-        tid_to_idx[orig_id] = ti
-
-    # Remap cohesion keys to render indices
-    cohesion_lut = {}
-    for f, (T_val, coh_per, coh_global) in cohesion_lut_raw.items():
-        remapped = {tid_to_idx[k]: v for k, v in coh_per.items() if k in tid_to_idx}
-        cohesion_lut[f] = (T_val, remapped, coh_global)
 
     print("Computing angles...")
     angles = {}
@@ -744,11 +573,7 @@ def render(
                     pt = full_trails[t][i]
                     full_trails[t][i] = M @ np.array([pt[0], pt[1], 1.0])
 
-        # ── Cohesion from precomputed CSV
-        frame_dets = fidx.get(f, [])
-        cohesion_data = cohesion_lut.get(f, (None, {}, None))
-
-        for ti, det in frame_dets:
+        for ti, det in fidx.get(f, []):
             col = get_color(ti)
             trk = tracks[ti]
             obb = det.get("obb")
@@ -781,7 +606,7 @@ def render(
                 info["delta"] = float(ad["delta_abs"][di])
             pinfo.append(info)
 
-        panel = draw_panel(h, panel_width, pinfo, full_trails, dtrails, cohesion_data, trail_length)
+        panel = draw_panel(h, panel_width, pinfo, full_trails, dtrails, trail_length)
         cv2.line(panel, (0, 0), (0, h), (60, 60, 60), 1)
         combined = np.hstack([frame, panel])
         cv2.putText(combined, f"Frame {f}",
@@ -798,11 +623,10 @@ def render(
 
 
 if __name__ == "__main__":
-    pa = argparse.ArgumentParser(description="Render OBB + cohesion + compass")
+    pa = argparse.ArgumentParser(description="Render OBB + absolute orientation compass")
     pa.add_argument("video")
     pa.add_argument("tracks", nargs="+")
     pa.add_argument("--cmc", required=True)
-    pa.add_argument("--cohesion", required=True, help="Path to cohesion_per_frame.csv")
     pa.add_argument("-o", "--output", default="output_angle.mp4")
     pa.add_argument("--trail", type=int, default=120)
     pa.add_argument("--smooth", type=int, default=120)
@@ -817,7 +641,7 @@ if __name__ == "__main__":
     a = pa.parse_args()
 
     render(
-        a.video, a.tracks, a.cmc, a.cohesion, a.output,
+        a.video, a.tracks, a.cmc, a.output,
         a.trail, a.smooth, a.thickness, a.panel_width,
         a.codec, a.start, a.end,
         a.savgol_win, a.savgol_poly, a.n_ref,

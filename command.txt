@@ -7,7 +7,8 @@ ffmpeg -ss 00:00:10 -to 00:01:20 -i /home/auguste/Downloads/transfer_12221686_fi
 python angle_render.py clips/selected/SIMP2021_114-00-08_06.mp4 \
 /home/auguste/Desktop/HammerTrack/projects/hammer/exports/2021_114/postp_tracks/*.json \
 --cmc projects/hammer/exports/2021_114/cmc_transforms.json \
--o projects/hammer/exports/2021_114/output_angle_good_interpol.mp4
+-o projects/hammer/exports/2021_114/output_angle_cohesion_fix_180.mp4 \
+--cohesion projects/hammer/exports/2021_114/cohesion_results.csv
 
 
 
