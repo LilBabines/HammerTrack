@@ -1,8 +1,8 @@
 import pandas as pd
 
 # === CONFIGURATION ===
-INPUT_CSV = "projects/hammer/exports/2021_114/output_angle_good_interpol_angle_absolute.csv"
-OUTPUT_CSV = "projects/hammer/exports/2021_114/global_orientation.csv"
+INPUT_CSV = "projects/hammer/exports/2021_114/more_tracks_angle_image.csv"
+OUTPUT_CSV = "projects/hammer/exports/2021_114/angle_image.csv"
 FPS = 30
 
 # Plages de temps (en secondes) où human_interaction = 1

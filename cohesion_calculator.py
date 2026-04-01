@@ -11,7 +11,8 @@ def load_tracks(json_dir: str, pattern: str = "*.json") -> dict:
     for fpath in sorted(glob.glob(str(Path(json_dir) / pattern))):
         with open(fpath, "r") as f:
             data = json.load(f)
-        track_id = data["merged_track_ids"][0]
+
+        track_id = fpath[:-5].split("_")[-1]
         tracks[track_id] = data
     return tracks
 
@@ -49,7 +50,7 @@ def compute_single_frame(frame: int, frame_index: dict, track_ids: list) -> dict
     if len(detections) < 2:
         # Pas assez de requins pour calculer une cohésion
         for tid in track_ids:
-            row[f"cohesion_{tid}"] = np.nan
+            row[f"shark_{tid}"] = np.nan
         row["T"] = np.nan
         row["cohesion_globale"] = np.nan
         return row
@@ -67,7 +68,7 @@ def compute_single_frame(frame: int, frame_index: dict, track_ids: list) -> dict
     cohesion_values = []
     for tid in track_ids:
         if tid not in centroids:
-            row[f"cohesion_{tid}"] = np.nan
+            row[f"shark_{tid}"] = np.nan
             continue
 
         dists = [
@@ -77,7 +78,7 @@ def compute_single_frame(frame: int, frame_index: dict, track_ids: list) -> dict
         ]
 
         ci = float(np.median(dists)) / T if (dists and T > 0) else np.nan
-        row[f"cohesion_{tid}"] = round(ci, 4) if not np.isnan(ci) else np.nan
+        row[f"shark_{tid}"] = round(ci, 4) if not np.isnan(ci) else np.nan
 
         if not np.isnan(ci):
             cohesion_values.append(ci)

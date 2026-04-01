@@ -525,12 +525,12 @@ if __name__ == "__main__":
         [19, 48, 72, 136],
         [139, 242, 413],
         [3, 50],
-        [12, 177, 243, 256],
+        [12,  7, 243, 256],
         [5, 77],
-        [13, 116, 155],
+        [13, 116, 155], 
         [18, 161, 186, 301, 332, 348, 384, 416, 477],
         [10],
-        [9, 120],
+        [9, 120],  
         [25, 78],
         [31],
         [23, 306, 361, 615],
@@ -547,12 +547,20 @@ if __name__ == "__main__":
         [4,70,88],
         [40],
         [151,270],
-        [15,89,106]
+        [15,89,106],
+        [110],
+        [134,162,174,191],
+        [137,148],
+        [163,172,189,258],
+        [166,176,233],
+        [180,235,250,254],
+        [202,229,249,277,313],
+        [407,414]
     ]
 
     all_merged: list[tuple[list[int], MergedTrack]] = []
 
-    for group in groups:
+    for num_i,group in enumerate(groups):
         if not group:
             continue
 
@@ -572,8 +580,9 @@ if __name__ == "__main__":
         merged = smooth_centroids(merged, method="savgol", window=7, polyorder=2)
 
         # Export JSON
-        tag = "_".join(str(i) for i in group)
-        export_merged(merged, f"projects/hammer/exports/2021_114/postp_tracks/merged_{tag}.json")
+        # tag = "_".join(str(i) for i in group)
+        tag = num_i
+        export_merged(merged, f"projects/hammer/exports/2021_114/postp_tracks/shark_{tag}.json")
 
         all_merged.append((group, merged))
 

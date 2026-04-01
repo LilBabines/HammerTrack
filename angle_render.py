@@ -30,7 +30,9 @@ from scipy.signal import savgol_filter
 
 def load_json(p):
     with open(p) as f:
-        return json.load(f)
+        track = json.load(f)
+    track['id']= p[:-5].split("_")[-1]
+    return track
 
 
 # ── CMC ──────────────────────────────────────────────────────────────
@@ -111,80 +113,67 @@ def smooth_dir(a, w=51, p=2):
 
 # ── Fix ±180° — local EMA, no cumulative offset ─────────────────────
 
-def fix_pi_jumps_local(angle_abs, traj_dir_abs, ema_alpha=0.85, traj_weight=0.3):
+def fix_pi_jumps_local(angle_abs, traj_dir_abs, ema_alpha=0.85):
     """
-    Fix ±π ambiguity locally at each frame using:
-      - an exponential moving average (EMA) of recent valid angles
-      - the trajectory direction as a secondary hint
+    Fix ±π ambiguity locally at each frame.
 
-    For each frame, two candidates exist (angle and angle±π).
-    We pick whichever is closest to a blended reference of
-    EMA (continuity) and trajectory (physics).
+    Priority rule:
+      1. If trajectory direction is available → pick the ±π candidate
+         closest to trajectory.  The trajectory gradient is the ground
+         truth for "which way the animal is going".
+      2. If trajectory is missing → fall back to EMA (temporal continuity).
 
-    No cumulative offset → a single bad frame does NOT contaminate
-    the rest of the sequence.
+    Forward + backward passes, then merge on trajectory when both
+    passes disagree.
     """
     valid_idx = np.where(~np.isnan(angle_abs))[0]
     if len(valid_idx) < 2:
         return angle_abs
 
-    fixed = angle_abs.copy()
-    ema = fixed[valid_idx[0]]
+    def _pass(indices, angles):
+        """Single-direction pass: trajectory-first disambiguation."""
+        out = angles.copy()
+        ema = out[indices[0]]
+        for k in range(1, len(indices)):
+            i = indices[k]
+            raw = out[i]
+            candidates = [raw, raw + np.pi, raw - np.pi]
 
-    for k in range(1, len(valid_idx)):
-        i = valid_idx[k]
-        raw = fixed[i]
-        candidates = [raw, raw + np.pi, raw - np.pi]
+            traj = traj_dir_abs[i] if not np.isnan(traj_dir_abs[i]) else np.nan
 
-        # Build reference: blend EMA with trajectory if available
-        traj = traj_dir_abs[i] if not np.isnan(traj_dir_abs[i]) else np.nan
-        if not np.isnan(traj):
-            ref = circular_blend(ema, traj, 1.0 - traj_weight)
-        else:
-            ref = ema
+            if not np.isnan(traj):
+                # ── Trajectory available → it decides
+                best = min(candidates, key=lambda c: abs(angle_diff(c, traj)))
+            else:
+                # ── No trajectory → use EMA for continuity
+                best = min(candidates, key=lambda c: abs(angle_diff(c, ema)))
 
-        # Pick candidate closest to reference
-        best = min(candidates, key=lambda c: abs(angle_diff(c, ref)))
-        fixed[i] = best
+            out[i] = best
+            ema = circular_blend(ema, best, ema_alpha)
+        return out
 
-        # Update EMA
-        ema = circular_blend(ema, best, ema_alpha)
+    # Forward pass
+    fixed_fwd = _pass(valid_idx, angle_abs.copy())
 
-    # ── Backward pass: same logic in reverse to catch early-sequence errors
-    ema = fixed[valid_idx[-1]]
-    fixed_bwd = fixed.copy()
-    for k in range(len(valid_idx) - 2, -1, -1):
-        i = valid_idx[k]
-        raw = fixed_bwd[i]
-        candidates = [raw, raw + np.pi, raw - np.pi]
+    # Backward pass
+    fixed_bwd = _pass(valid_idx[::-1], angle_abs.copy())
 
-        traj = traj_dir_abs[i] if not np.isnan(traj_dir_abs[i]) else np.nan
-        if not np.isnan(traj):
-            ref = circular_blend(ema, traj, 1.0 - traj_weight)
-        else:
-            ref = ema
-
-        best = min(candidates, key=lambda c: abs(angle_diff(c, ref)))
-        fixed_bwd[i] = best
-        ema = circular_blend(ema, best, ema_alpha)
-
-    # ── Merge: for each frame, pick the candidate (fwd or bwd) closest to trajectory
-    merged = fixed.copy()
+    # Merge: trajectory wins when passes disagree
+    merged = fixed_fwd.copy()
     for k in range(len(valid_idx)):
         i = valid_idx[k]
-        traj = traj_dir_abs[i] if not np.isnan(traj_dir_abs[i]) else np.nan
-        fwd_val = fixed[i]
+        fwd_val = fixed_fwd[i]
         bwd_val = fixed_bwd[i]
 
         if abs(angle_diff(fwd_val, bwd_val)) < 0.1:
-            # Both agree
             merged[i] = fwd_val
-        elif not np.isnan(traj):
-            # Pick whichever is closer to trajectory
-            merged[i] = min([fwd_val, bwd_val], key=lambda c: abs(angle_diff(c, traj)))
         else:
-            # Default to forward pass
-            merged[i] = fwd_val
+            traj = traj_dir_abs[i] if not np.isnan(traj_dir_abs[i]) else np.nan
+            if not np.isnan(traj):
+                merged[i] = min([fwd_val, bwd_val],
+                                key=lambda c: abs(angle_diff(c, traj)))
+            else:
+                merged[i] = fwd_val
 
     return merged
 
@@ -359,11 +348,11 @@ def load_cohesion_csv(csv_path):
     cohesion_lut = {}
 
     # Detect cohesion_* columns → extract track ids
-    coh_cols = [c for c in df.columns if c.startswith("cohesion_") and c != "cohesion_globale"]
+    coh_cols = [c for c in df.columns if c.startswith("shark_") and c != "cohesion_globale"]
     # track ids from column names: "cohesion_3" → 3
     tid_map = {}
     for c in coh_cols:
-        tid_str = c.replace("cohesion_", "")
+        tid_str = c.replace("shark_", "")
         try:
             tid_map[c] = int(tid_str)
         except ValueError:
@@ -612,8 +601,8 @@ def export_csvs(tracks, angles, output_prefix):
     track_labels = []
     all_frames = set()
     for ti, t in enumerate(tracks):
-        ids = t.get("merged_track_ids", [ti])
-        track_labels.append("_".join(str(x) for x in ids))
+        ids = t["id"]
+        track_labels.append(ids)
         for d in t["detections"]:
             all_frames.add(d["frame"])
 
@@ -631,7 +620,7 @@ def export_csvs(tracks, angles, output_prefix):
         path = output_prefix + suffix
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["frame"] + [f"track_{lb}" for lb in track_labels])
+            w.writerow(["frame"] + [f"shark_{lb}" for lb in track_labels])
             for f in frames_sorted:
                 row = [f]
                 for ti in range(len(tracks)):
