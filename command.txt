@@ -7,7 +7,7 @@ ffmpeg -ss 00:00:10 -to 00:01:20 -i /home/auguste/Downloads/transfer_12221686_fi
 python angle_render.py clips/selected/SIMP2021_114-00-08_06.mp4 \
 /home/auguste/Desktop/HammerTrack/projects/hammer/exports/2021_114/postp_tracks/*.json \
 --cmc projects/hammer/exports/2021_114/cmc_transforms.json \
--o projects/hammer/exports/2021_114/output_angle_cohesion_fix_fix_180.mp4 \
+-o projects/hammer/exports/2021_114/okok.mp4 \
 --cohesion projects/hammer/exports/2021_114/cohesion_results.csv
 
 
@@ -31,3 +31,6 @@ python angle_render.py clips/selected/SIMP2021_114-00-08_06.mp4 \
 
 
 python json2csv.py projects/hammer/exports/2021_114/postp_tracks/*.json -o projects/hammer/exports/2021_114/postp_tracks_csv/
+
+
+ffmpeg -i clips/selected/SIMP2021_057-13_10-16_25.mp4 -q:v 2 -vf scale=1024:-2 -start_number 0 clips/by_frames/SIMP2021_057/%06d.jpg

@@ -138,6 +138,7 @@ celerybeat.pid
 .env
 .envrc
 .venv
+.venv_sam2
 env/
 venv/
 ENV/
@@ -239,6 +240,5 @@ checkpoints/
 runs/
 
 projects/
-
 
 clips/

@@ -46,15 +46,15 @@ def convert(json_path, output_dir, end_frame):
         for f in range(0, end_frame + 1):
             det = by_frame.get(f)
             if det is None:
-                w.writerow([f] + ["NA"] * 11)
+                w.writerow([f] + [""] * 11)
             else:
                 cx, cy = det["centroid"]
-                interp = det.get("interpolated", "NA")
+                interp = det.get("interpolated", "")
                 obb = det.get("obb")
                 if obb and len(obb) == 4:
                     obb_flat = [coord for pt in obb for coord in pt]
                 else:
-                    obb_flat = ["NA"] * 8
+                    obb_flat = [""] * 8
                 w.writerow([f, cx, cy, interp] + obb_flat)
 
     print(f"  {out_path}  (track {label}, {len(by_frame)} dets, "
