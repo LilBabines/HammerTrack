@@ -2,21 +2,22 @@ import os
 import subprocess
 import json
 import csv
+import glob
 import shutil
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 import cv2
 from sam2.build_sam import build_sam2_video_predictor
-import glob
-# --- Config ---
-VIDEO_PATH = "clips/selected/SIMP2021_114-00-08_06.mp4"
-OUTPUT_PATH = "projects/hammer/exports/2021_114/output_masked_5p.mp4"
-FRAMES_DIR = "clips/by_frames/SIMP2021_114"
-CSV_OUTPUT_DIR = "projects/hammer/exports/2021_114/keypoints/"
 
-# Liste des tracks (glob pattern ou liste explicite)
-TRACK_PATTERN = "projects/hammer/exports/2021_114/postp_tracks/*.json"
+# --- Config ---
+VIDEO_PATH = "clips/selected/SIMP2021_057-13_10-16_25.mp4"
+OUTPUT_PATH = "projects/hammer/exports/2021_057/output_masked.mp4"
+FRAMES_DIR = "clips/by_frames/SIMP2021_057"
+CSV_OUTPUT_DIR = "projects/hammer/exports/2021_057/keypoints/"
+
+TRACK_PATTERN = "projects/hammer/exports/2021_057/postp_tracks/*.json"
 TRACK_FILES = sorted(glob.glob(TRACK_PATTERN))
 print(f"Found {len(TRACK_FILES)} tracks: {[os.path.basename(f) for f in TRACK_FILES]}")
 
@@ -45,7 +46,18 @@ TRACK_COLORS = [
 ]
 
 
-def extract_keypoints(binary_mask):
+NUM_WORKERS = min(8, os.cpu_count() or 4)
+
+
+def process_track_mask(args):
+    """Calcule keypoints + angles pour un track (exécuté en thread)."""
+    tid, binary_mask, mask_score = args
+    mask_pixels = binary_mask.sum()
+    if mask_pixels == 0:
+        return tid, mask_pixels, None, None
+    kp = extract_keypoints(binary_mask)
+    angles = compute_angles(kp) if kp else None
+    return tid, mask_pixels, kp, angles
     contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return None
@@ -141,6 +153,21 @@ def compute_angles(kp):
         "art1_tail": vec_angle(a1, tail),
         "art2_tail": vec_angle(a2, tail),
     }
+
+
+NUM_WORKERS = min(8, os.cpu_count() or 4)
+thread_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
+
+
+def process_track_mask(args):
+    """Calcule keypoints + angles pour un track (exécuté en thread)."""
+    tid, binary_mask = args
+    mask_pixels = binary_mask.sum()
+    if mask_pixels == 0:
+        return tid, 0, None, None
+    kp = extract_keypoints(binary_mask)
+    angles = compute_angles(kp) if kp else None
+    return tid, mask_pixels, kp, angles
 
 
 def draw_graph(angle_buffers, track_colors, fps):
@@ -264,6 +291,17 @@ ffplay_proc = subprocess.Popen(
      "-window_title", "SAM2 Sharks", "-"],
     stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
 )
+display_alive = True
+
+
+def send_to_display(canvas):
+    global display_alive
+    if not display_alive:
+        return
+    if ffplay_proc.poll() is not None:
+        display_alive = False
+        return
+    ffplay_proc.stdin.write(cv2.resize(canvas, (disp_w, disp_h)).tobytes())
 
 # --- Process par chunks ---
 reprompt_count = 0
@@ -285,14 +323,17 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
         os.symlink(os.path.abspath(src), dst)
 
     # Trouver les tracks actifs dans ce chunk + leur premier prompt
-    chunk_track_prompts = {}  # tid -> (local_idx, det)
+    chunk_track_prompts = {}
     for tid, t in tracks.items():
-        for offset in range(chunk_len):
-            gi = chunk_start + offset
-            det = t["det_by_frame"].get(gi)
-            if det and not det.get("interpolated", False):
-                chunk_track_prompts[tid] = (offset, det)
-                break
+        first_det = next(
+            ((offset, t["det_by_frame"][chunk_start + offset])
+             for offset in range(chunk_len)
+             if chunk_start + offset in t["det_by_frame"]
+             and not t["det_by_frame"][chunk_start + offset].get("interpolated", False)),
+            None,
+        )
+        if first_det:
+            chunk_track_prompts[tid] = first_det
 
     active_tids = list(chunk_track_prompts.keys())
     print(f"  {len(active_tids)} active tracks")
@@ -305,10 +346,7 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
             canvas[:, :w] = frame
             canvas[h - GRAPH_H:, w:] = draw_graph(angle_buffers, track_colors, fps)
             writer.write(canvas)
-            try:
-                ffplay_proc.stdin.write(cv2.resize(canvas, (disp_w, disp_h)).tobytes())
-            except BrokenPipeError:
-                pass
+            send_to_display(canvas)
         continue
 
     # Traiter les tracks par sous-groupes (batches)
@@ -383,60 +421,66 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
         gi = chunk_start + local_idx
         frame = cv2.imread(os.path.join(FRAMES_DIR, f"{gi:06d}.jpg"))
 
-        for tid, (binary_mask, mask_score) in chunk_results.get(local_idx, {}).items():
-            color = tracks[tid]["color"]
-            mask_pixels = binary_mask.sum()
+        frame_tracks = chunk_results.get(local_idx, {})
 
-            if mask_pixels > 0:
+        # 1) Appliquer tous les masques (séquentiel, modifie la frame)
+        for tid, (binary_mask, mask_score) in frame_tracks.items():
+            if binary_mask.sum() > 0:
                 overlay = frame.copy()
-                overlay[binary_mask == 1] = color
+                overlay[binary_mask == 1] = tracks[tid]["color"]
                 frame = cv2.addWeighted(overlay, MASK_ALPHA, frame, 1 - MASK_ALPHA, 0)
                 contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(frame, contours, -1, color, CONTOUR_THICKNESS)
+                cv2.drawContours(frame, contours, -1, tracks[tid]["color"], CONTOUR_THICKNESS)
 
-            kp = extract_keypoints(binary_mask) if mask_pixels > 0 else None
-            angles = compute_angles(kp) if kp else None
+        # 2) Calculer tous les keypoints en parallèle
+        tasks = [(tid, binary_mask) for tid, (binary_mask, _) in frame_tracks.items()]
+        results = list(thread_pool.map(process_track_mask, tasks))
 
-            if kp and angles:
-                csv_writers[tid].writerow([
-                    gi,
-                    f"{kp['head_x']:.2f}", f"{kp['head_y']:.2f}",
-                    f"{kp['com_x']:.2f}", f"{kp['com_y']:.2f}",
-                    f"{kp['art1_x']:.2f}", f"{kp['art1_y']:.2f}",
-                    f"{kp['art2_x']:.2f}", f"{kp['art2_y']:.2f}",
-                    f"{kp['tail_x']:.2f}", f"{kp['tail_y']:.2f}",
-                    f"{kp['angle_rad']:.4f}",
-                    f"{angles['com_tail']:.4f}",
-                    f"{angles['art1_tail']:.4f}",
-                    f"{angles['art2_tail']:.4f}",
-                ])
+        # 3) Dessiner les keypoints + écrire CSV (séquentiel)
+        for tid, mask_pixels, kp, angles in results:
+            if not kp or not angles:
+                continue
+            color = tracks[tid]["color"]
 
-                radius = max(6, int(w / 400))
-                thickness = max(2, int(w / 800))
-                font_kp = max(0.8, w / 2500)
-                hpt = (int(kp["head_x"]), int(kp["head_y"]))
-                cpt = (int(kp["com_x"]), int(kp["com_y"]))
-                a1pt = (int(kp["art1_x"]), int(kp["art1_y"]))
-                a2pt = (int(kp["art2_x"]), int(kp["art2_y"]))
-                tpt = (int(kp["tail_x"]), int(kp["tail_y"]))
+            csv_writers[tid].writerow([
+                gi,
+                f"{kp['head_x']:.2f}", f"{kp['head_y']:.2f}",
+                f"{kp['com_x']:.2f}", f"{kp['com_y']:.2f}",
+                f"{kp['art1_x']:.2f}", f"{kp['art1_y']:.2f}",
+                f"{kp['art2_x']:.2f}", f"{kp['art2_y']:.2f}",
+                f"{kp['tail_x']:.2f}", f"{kp['tail_y']:.2f}",
+                f"{kp['angle_rad']:.4f}",
+                f"{angles['com_tail']:.4f}",
+                f"{angles['art1_tail']:.4f}",
+                f"{angles['art2_tail']:.4f}",
+            ])
 
-                cv2.drawMarker(frame, hpt, color, cv2.MARKER_CROSS, radius * 2, thickness)
-                if "head_p1" in kp:
-                    cv2.line(frame, kp["head_p1"], kp["head_p2"], color, thickness)
-                    cv2.circle(frame, kp["head_p1"], radius, color, -1)
-                    cv2.circle(frame, kp["head_p2"], radius, color, -1)
-                cv2.circle(frame, cpt, radius, (255, 255, 255), thickness)
-                cv2.drawMarker(frame, a1pt, color, cv2.MARKER_DIAMOND, radius * 2, thickness)
-                cv2.drawMarker(frame, a2pt, color, cv2.MARKER_DIAMOND, radius * 2, thickness)
-                cv2.drawMarker(frame, tpt, color, cv2.MARKER_TRIANGLE_UP, radius * 2, thickness)
-                cv2.line(frame, hpt, cpt, color, thickness)
-                cv2.line(frame, cpt, a1pt, color, thickness)
-                cv2.line(frame, a1pt, a2pt, color, thickness)
-                cv2.line(frame, a2pt, tpt, color, thickness)
+            radius = max(6, int(w / 400))
+            thickness = max(2, int(w / 800))
+            font_kp = max(0.8, w / 2500)
+            hpt = (int(kp["head_x"]), int(kp["head_y"]))
+            cpt = (int(kp["com_x"]), int(kp["com_y"]))
+            a1pt = (int(kp["art1_x"]), int(kp["art1_y"]))
+            a2pt = (int(kp["art2_x"]), int(kp["art2_y"]))
+            tpt = (int(kp["tail_x"]), int(kp["tail_y"]))
 
-                angle_buffers[tid].append(angles)
-                if len(angle_buffers[tid]) > max_buffer:
-                    angle_buffers[tid].pop(0)
+            cv2.drawMarker(frame, hpt, color, cv2.MARKER_CROSS, radius * 2, thickness)
+            if "head_p1" in kp:
+                cv2.line(frame, kp["head_p1"], kp["head_p2"], color, thickness)
+                cv2.circle(frame, kp["head_p1"], radius, color, -1)
+                cv2.circle(frame, kp["head_p2"], radius, color, -1)
+            cv2.circle(frame, cpt, radius, (255, 255, 255), thickness)
+            cv2.drawMarker(frame, a1pt, color, cv2.MARKER_DIAMOND, radius * 2, thickness)
+            cv2.drawMarker(frame, a2pt, color, cv2.MARKER_DIAMOND, radius * 2, thickness)
+            cv2.drawMarker(frame, tpt, color, cv2.MARKER_TRIANGLE_UP, radius * 2, thickness)
+            cv2.line(frame, hpt, cpt, color, thickness)
+            cv2.line(frame, cpt, a1pt, color, thickness)
+            cv2.line(frame, a1pt, a2pt, color, thickness)
+            cv2.line(frame, a2pt, tpt, color, thickness)
+
+            angle_buffers[tid].append(angles)
+            if len(angle_buffers[tid]) > max_buffer:
+                angle_buffers[tid].pop(0)
 
         font_scale = max(1, w / 1500)
         cv2.putText(frame, f"Frame {gi}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 3)
@@ -446,17 +490,15 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
         canvas[h - GRAPH_H:, w:] = draw_graph(angle_buffers, track_colors, fps)
 
         writer.write(canvas)
-        try:
-            ffplay_proc.stdin.write(cv2.resize(canvas, (disp_w, disp_h)).tobytes())
-        except BrokenPipeError:
-            print("Display window closed")
-            break
+        send_to_display(canvas)
 
 writer.release()
+thread_pool.shutdown()
 for f in csv_files.values():
     f.close()
-ffplay_proc.stdin.close()
-ffplay_proc.wait()
+if display_alive:
+    ffplay_proc.stdin.close()
+    ffplay_proc.wait()
 shutil.rmtree(CHUNK_FRAMES_DIR, ignore_errors=True)
 print(f"\nDone! {OUTPUT_PATH} ({total_frames} frames, {reprompt_count} re-prompts)")
 print(f"Keypoints CSVs in: {CSV_OUTPUT_DIR}")

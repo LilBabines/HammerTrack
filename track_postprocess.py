@@ -562,14 +562,24 @@ if __name__ == "__main__":
         [224],[225,374],
         [240],
         [209,310,325],
-        [325],
         [316],
         [318],
         [319],
         [323],
         [327],
-        [345]
+        [345],
+        [317],
+        [347],
+        [377],
+        [379,458],
+        [387,417,432],
     ]  
+    flat = [x for sub in groups for x in sub]
+    has_duplicates = len(flat) != len(set(flat))
+    from collections import Counter
+    dupes = [x for x, c in Counter(flat).items() if c > 1]
+    print(dupes)
+    assert len(dupes)==0
 
     all_merged: list[tuple[list[int], MergedTrack]] = []
 
@@ -600,14 +610,14 @@ if __name__ == "__main__":
         all_merged.append((group, merged))
 
     # # 3. Render toutes les tracks sur la vidéo
-    # render_tracks_on_video(
-    #     video_path="clips/selected/SIMP2021_114-00-08_06.mp4",
-    #     all_merged=all_merged,
-    #     output_path="projects/hammer/exports/2021_114/postp_tracks/overlay.mp4",
-    #     trail_length=200,
-    #     draw_bbox=False,
-    #     draw_obb=True,
-    #     draw_centroid=True,
-    #     draw_trail=True,
-    #     draw_label=False,
-    # )
+    render_tracks_on_video(
+        video_path="clips/selected/SIMP2021_114-00-08_06.mp4",
+        all_merged=all_merged,
+        output_path="projects/hammer/exports/2021_114/overlay_pp.mp4",
+        trail_length=10 ,
+        draw_bbox=False,
+        draw_obb=True,
+        draw_centroid=True,
+        draw_trail=True,
+        draw_label=True,
+    )
