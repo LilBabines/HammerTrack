@@ -26,7 +26,7 @@ SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
 
 CHUNK_SIZE = 200
 MASK_CONFIDENCE_THRESHOLD = 0.85
-MAX_TRACKS_PER_BATCH = 6  # tracks simultanés par passe SAM2
+MAX_TRACKS_PER_BATCH = 6
 MASK_ALPHA = 0.45
 CONTOUR_THICKNESS = 4
 
@@ -36,6 +36,7 @@ GRAPH_H = 400
 GRAPH_MARGIN = 40
 
 CHUNK_FRAMES_DIR = "/tmp/sam2_chunk"
+NUM_WORKERS = min(8, os.cpu_count() or 4)
 
 TRACK_COLORS = [
     (0, 200, 255), (255, 100, 0), (0, 255, 100), (200, 0, 255),
@@ -46,18 +47,12 @@ TRACK_COLORS = [
 ]
 
 
-NUM_WORKERS = min(8, os.cpu_count() or 4)
+# =============================================================================
+# Fonctions de calcul
+# =============================================================================
 
-
-def process_track_mask(args):
-    """Calcule keypoints + angles pour un track (exécuté en thread)."""
-    tid, binary_mask, mask_score = args
-    mask_pixels = binary_mask.sum()
-    if mask_pixels == 0:
-        return tid, mask_pixels, None, None
-    kp = extract_keypoints(binary_mask)
-    angles = compute_angles(kp) if kp else None
-    return tid, mask_pixels, kp, angles
+def extract_keypoints(binary_mask):
+    """Extrait head (milieu du cephalofoil), COM, art1, art2, tail."""
     contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return None
@@ -71,6 +66,7 @@ def process_track_mask(args):
     com = np.array([M["m10"] / M["m00"], M["m01"] / M["m00"]])
     pts = contour.reshape(-1, 2).astype(np.float64)
 
+    # Tail = point le plus loin du COM
     dists_to_com = np.linalg.norm(pts - com, axis=1)
     tail = pts[dists_to_com.argmax()]
 
@@ -86,6 +82,7 @@ def process_track_mask(args):
     n_steps = 80
     step_size = abs(min_proj) / max(n_steps, 1)
 
+    # Head : coupe la plus large côté tête × distance au COM
     best_score = 0
     best_p1 = best_p2 = None
     for t in np.linspace(min_proj, 0, n_steps):
@@ -110,6 +107,7 @@ def process_track_mask(args):
         head = (best_p1 + best_p2) / 2
         head_p1, head_p2 = best_p1, best_p2
 
+    # Articulations à 1/3 et 2/3 entre COM et tail
     articulations = []
     for frac in [1 / 3, 2 / 3]:
         target_t = body_len * frac
@@ -121,6 +119,7 @@ def process_track_mask(args):
         else:
             articulations.append(com + body_vec * frac)
 
+    # Angle head->COM->tail
     v1 = com - head
     v2 = tail - com
     angle = np.arctan2(v2[1], v2[0]) - np.arctan2(v1[1], v1[0])
@@ -141,6 +140,7 @@ def process_track_mask(args):
 
 
 def compute_angles(kp):
+    """Calcule les 3 angles des vecteurs vers la queue."""
     tail = np.array([kp["tail_x"], kp["tail_y"]])
     com = np.array([kp["com_x"], kp["com_y"]])
     a1 = np.array([kp["art1_x"], kp["art1_y"]])
@@ -155,10 +155,6 @@ def compute_angles(kp):
     }
 
 
-NUM_WORKERS = min(8, os.cpu_count() or 4)
-thread_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
-
-
 def process_track_mask(args):
     """Calcule keypoints + angles pour un track (exécuté en thread)."""
     tid, binary_mask = args
@@ -171,6 +167,7 @@ def process_track_mask(args):
 
 
 def draw_graph(angle_buffers, track_colors, fps):
+    """Dessine le graphique art2_tail pour chaque track."""
     graph = np.zeros((GRAPH_H, GRAPH_W, 3), dtype=np.uint8)
     graph[:] = (30, 30, 30)
     gx0, gx1 = GRAPH_MARGIN, GRAPH_W - 10
@@ -223,6 +220,21 @@ def draw_graph(angle_buffers, track_colors, fps):
 
     return graph
 
+
+def send_to_display(canvas):
+    """Envoie une frame au processus ffplay."""
+    global display_alive
+    if not display_alive:
+        return
+    if ffplay_proc.poll() is not None:
+        display_alive = False
+        return
+    ffplay_proc.stdin.write(cv2.resize(canvas, (disp_w, disp_h)).tobytes())
+
+
+# =============================================================================
+# Setup
+# =============================================================================
 
 # --- Video info ---
 cap = cv2.VideoCapture(VIDEO_PATH)
@@ -293,17 +305,14 @@ ffplay_proc = subprocess.Popen(
 )
 display_alive = True
 
+# --- Thread pool ---
+thread_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
-def send_to_display(canvas):
-    global display_alive
-    if not display_alive:
-        return
-    if ffplay_proc.poll() is not None:
-        display_alive = False
-        return
-    ffplay_proc.stdin.write(cv2.resize(canvas, (disp_w, disp_h)).tobytes())
 
-# --- Process par chunks ---
+# =============================================================================
+# Processing
+# =============================================================================
+
 reprompt_count = 0
 max_buffer = int(fps * GRAPH_SECONDS)
 angle_buffers = {tid: [] for tid in tracks}
@@ -322,7 +331,7 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
         dst = os.path.join(CHUNK_FRAMES_DIR, f"{i:06d}.jpg")
         os.symlink(os.path.abspath(src), dst)
 
-    # Trouver les tracks actifs dans ce chunk + leur premier prompt
+    # Trouver les tracks actifs dans ce chunk
     chunk_track_prompts = {}
     for tid, t in tracks.items():
         first_det = next(
@@ -338,6 +347,7 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
     active_tids = list(chunk_track_prompts.keys())
     print(f"  {len(active_tids)} active tracks")
 
+    # Chunk sans tracks actifs
     if not active_tids:
         for i in range(chunk_len):
             gi = chunk_start + i
@@ -349,12 +359,11 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
             send_to_display(canvas)
         continue
 
-    # Traiter les tracks par sous-groupes (batches)
+    # Traiter par sous-groupes
     batches = [active_tids[i:i + MAX_TRACKS_PER_BATCH]
                for i in range(0, len(active_tids), MAX_TRACKS_PER_BATCH)]
 
-    # Stocker les résultats de chaque batch : frame_idx -> {tid -> (binary_mask, mask_score)}
-    chunk_results = defaultdict(dict)
+    chunk_results = defaultdict(dict)  # local_idx -> {tid -> (binary_mask, mask_score)}
 
     for batch_idx, batch_tids in enumerate(batches):
         print(f"  Batch {batch_idx + 1}/{len(batches)}: tracks {batch_tids}")
@@ -366,8 +375,8 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
             offload_state_to_cpu=True,
         )
 
-        # Prompt chaque track du batch
         with torch.autocast("cuda", dtype=torch.bfloat16):
+            # Prompt chaque track du batch
             for tid in batch_tids:
                 local_idx, det = chunk_track_prompts[tid]
                 x1, y1, x2, y2 = det["bbox"]
@@ -382,8 +391,7 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
                     labels=np.array([1], dtype=np.int32),
                 )
 
-        # Propager
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+            # Propager
             for local_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
                 gi = chunk_start + local_idx
                 for i, sam2_id in enumerate(obj_ids):
@@ -392,7 +400,6 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
                     mask_score = mask_probs.max().item()
                     binary_mask = (mask_probs[0] > 0.5).cpu().numpy().astype(np.uint8)
 
-                    # Re-prompt si score chute
                     if mask_score < MASK_CONFIDENCE_THRESHOLD:
                         det = tracks[tid]["det_by_frame"].get(gi)
                         if det and not det.get("interpolated", False):
@@ -416,14 +423,13 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
         del predictor, inference_state
         torch.cuda.empty_cache()
 
-    # --- Composer les frames avec tous les résultats ---
+    # --- Composer les frames ---
     for local_idx in range(chunk_len):
         gi = chunk_start + local_idx
         frame = cv2.imread(os.path.join(FRAMES_DIR, f"{gi:06d}.jpg"))
-
         frame_tracks = chunk_results.get(local_idx, {})
 
-        # 1) Appliquer tous les masques (séquentiel, modifie la frame)
+        # 1) Appliquer tous les masques
         for tid, (binary_mask, mask_score) in frame_tracks.items():
             if binary_mask.sum() > 0:
                 overlay = frame.copy()
@@ -432,11 +438,11 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
                 contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(frame, contours, -1, tracks[tid]["color"], CONTOUR_THICKNESS)
 
-        # 2) Calculer tous les keypoints en parallèle
+        # 2) Calculer keypoints en parallèle
         tasks = [(tid, binary_mask) for tid, (binary_mask, _) in frame_tracks.items()]
         results = list(thread_pool.map(process_track_mask, tasks))
 
-        # 3) Dessiner les keypoints + écrire CSV (séquentiel)
+        # 3) Dessiner + CSV
         for tid, mask_pixels, kp, angles in results:
             if not kp or not angles:
                 continue
@@ -491,6 +497,11 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
 
         writer.write(canvas)
         send_to_display(canvas)
+
+
+# =============================================================================
+# Cleanup
+# =============================================================================
 
 writer.release()
 thread_pool.shutdown()
