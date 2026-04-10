@@ -1,6 +1,11 @@
 """
 Render OBB + cohesion + compass on video.
 
+Track identity
+  Every track is identified by the stem of its JSON filename (e.g. "shark_3").
+  This ID is used consistently for: video labels, CSV columns, cohesion lookup,
+  and panel display.  There is NO dependency on merged_track_ids.
+
 Angle computation (image space):
   1. CMC-warped trail → trajectory direction
   2. OBB long axis smoothed (×2 trick, π-periodic)
@@ -22,17 +27,25 @@ import json
 import argparse
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from collections import defaultdict
 from scipy.signal import savgol_filter
 
 
-# ── JSON ─────────────────────────────────────────────────────────────
+# ── JSON loaders ─────────────────────────────────────────────────────
 
-def load_json(p):
+def load_track_json(p):
+    """Load a post-processed track JSON.  ID = filename stem (e.g. 'shark_3')."""
     with open(p) as f:
         track = json.load(f)
-    track['id']= p[:-5].split("_")[-1]
+    track["id"] = Path(p).stem          # "shark_3"
     return track
+
+
+def load_cmc_json(p):
+    """Load a CMC transforms JSON (plain dict, no extra keys)."""
+    with open(p) as f:
+        return json.load(f)
 
 
 # ── CMC ──────────────────────────────────────────────────────────────
@@ -73,12 +86,10 @@ def disambiguate(axis_angle, direction):
 
 
 def circular_mean(angles):
-    """Circular mean of a list of angles."""
     return np.arctan2(np.mean(np.sin(angles)), np.mean(np.cos(angles)))
 
 
 def circular_blend(a, b, alpha):
-    """Blend angle a (weight alpha) with angle b (weight 1-alpha)."""
     return np.arctan2(
         alpha * np.sin(a) + (1 - alpha) * np.sin(b),
         alpha * np.cos(a) + (1 - alpha) * np.cos(b),
@@ -114,24 +125,11 @@ def smooth_dir(a, w=51, p=2):
 # ── Fix ±180° — local EMA, no cumulative offset ─────────────────────
 
 def fix_pi_jumps_local(angle_abs, traj_dir_abs, ema_alpha=0.85):
-    """
-    Fix ±π ambiguity locally at each frame.
-
-    Priority rule:
-      1. If trajectory direction is available → pick the ±π candidate
-         closest to trajectory.  The trajectory gradient is the ground
-         truth for "which way the animal is going".
-      2. If trajectory is missing → fall back to EMA (temporal continuity).
-
-    Forward + backward passes, then merge on trajectory when both
-    passes disagree.
-    """
     valid_idx = np.where(~np.isnan(angle_abs))[0]
     if len(valid_idx) < 2:
         return angle_abs
 
     def _pass(indices, angles):
-        """Single-direction pass: trajectory-first disambiguation."""
         out = angles.copy()
         ema = out[indices[0]]
         for k in range(1, len(indices)):
@@ -142,23 +140,17 @@ def fix_pi_jumps_local(angle_abs, traj_dir_abs, ema_alpha=0.85):
             traj = traj_dir_abs[i] if not np.isnan(traj_dir_abs[i]) else np.nan
 
             if not np.isnan(traj):
-                # ── Trajectory available → it decides
                 best = min(candidates, key=lambda c: abs(angle_diff(c, traj)))
             else:
-                # ── No trajectory → use EMA for continuity
                 best = min(candidates, key=lambda c: abs(angle_diff(c, ema)))
 
             out[i] = best
             ema = circular_blend(ema, best, ema_alpha)
         return out
 
-    # Forward pass
     fixed_fwd = _pass(valid_idx, angle_abs.copy())
-
-    # Backward pass
     fixed_bwd = _pass(valid_idx[::-1], angle_abs.copy())
 
-    # Merge: trajectory wins when passes disagree
     merged = fixed_fwd.copy()
     for k in range(len(valid_idx)):
         i = valid_idx[k]
@@ -333,50 +325,35 @@ def compute_group_ref_and_deltas(angles: dict, n_ref_frames: int):
 
 # ── Cohesion (loaded from precomputed CSV) ───────────────────────────
 
-def bbox_diagonal(bbox):
-    w = bbox[2] - bbox[0]
-    h = bbox[3] - bbox[1]
-    return np.sqrt(w**2 + h**2)
-
-
 def load_cohesion_csv(csv_path):
     """
-    Load cohesion CSV (one row per frame) produced by the cohesion script.
-    Returns a dict: {frame: (T, {track_id: cohesion_i}, cohesion_global)}
+    Load cohesion CSV (one row per frame).
+    Columns expected: frame, T, shark_0, shark_1, …, cohesion_globale
+    The shark_* column names must match the track file stems exactly.
+    Returns dict: {frame: (T, {track_id_str: cohesion_i}, cohesion_global)}
     """
     df = pd.read_csv(csv_path)
     cohesion_lut = {}
 
-    # Detect cohesion_* columns → extract track ids
-    coh_cols = [c for c in df.columns if c.startswith("shark_") and c != "cohesion_globale"]
-    # track ids from column names: "cohesion_3" → 3
-    tid_map = {}
-    for c in coh_cols:
-        tid_str = c.replace("shark_", "")
-        try:
-            tid_map[c] = int(tid_str)
-        except ValueError:
-            tid_map[c] = tid_str
+    # Detect shark_* columns (these are the per-track cohesion values)
+    coh_cols = [c for c in df.columns
+                if c.startswith("shark_") and c != "cohesion_globale"]
 
     for _, row in df.iterrows():
         f = int(row["frame"])
         T_val = row.get("T", None)
-        if pd.isna(T_val):
-            T_val = None
-        else:
-            T_val = float(T_val)
+        T_val = float(T_val) if pd.notna(T_val) else None
 
+        # Keys are kept as column names ("shark_0", "shark_3", …)
+        # so they match track["id"] directly.
         coh_per = {}
-        for c, tid in tid_map.items():
+        for c in coh_cols:
             v = row.get(c, None)
             if pd.notna(v):
-                coh_per[tid] = float(v)
+                coh_per[c] = float(v)      # key = "shark_0" etc.
 
         coh_global = row.get("cohesion_globale", None)
-        if pd.isna(coh_global):
-            coh_global = None
-        else:
-            coh_global = float(coh_global)
+        coh_global = float(coh_global) if pd.notna(coh_global) else None
 
         cohesion_lut[f] = (T_val, coh_per, coh_global)
 
@@ -422,7 +399,7 @@ def draw_arrow(fr, c, angle, col, length=50, th=2):
 
 # ── Panel ────────────────────────────────────────────────────────────
 
-def draw_panel(ph, pw, infos, full_trails, display_trails, cohesion_data, tl=40):
+def draw_panel(ph, pw, infos, full_trails, cohesion_data):
     """
     Panel layout (top to bottom):
       - Trajectories     (~40%)
@@ -449,8 +426,8 @@ def draw_panel(ph, pw, infos, full_trails, display_trails, cohesion_data, tl=40)
 
     if len(all_pts) >= 2:
         anp = np.array(all_pts)
-        mn, mx = anp.min(axis=0), anp.max(axis=0)
-        span = mx - mn
+        mn, mx_pt = anp.min(axis=0), anp.max(axis=0)
+        span = mx_pt - mn
         m = 12
         draw_w, draw_h = pw - 2 * m, traj_h - 2 * m - 16
         sx = draw_w / max(span[0], 1e-3)
@@ -482,7 +459,6 @@ def draw_panel(ph, pw, infos, full_trails, display_trails, cohesion_data, tl=40)
             else:
                 cv2.circle(panel, tp(pts[-1]), 5, col, 1)
 
-    # Separator
     cv2.line(panel, (0, traj_h), (pw, traj_h), (50, 50, 50), 2)
 
     # ══════════════════════════════════════════════════════════════════
@@ -490,12 +466,12 @@ def draw_panel(ph, pw, infos, full_trails, display_trails, cohesion_data, tl=40)
     # ══════════════════════════════════════════════════════════════════
     y0 = traj_h
     T_val, coh_per, coh_global = cohesion_data
+    # coh_per keys are render indices (int) after remapping in render()
 
     cv2.putText(panel, "Cohesion", (4, y0 + 16),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
 
     if coh_global is not None:
-        # ── Global value (large)
         gtxt = f"{coh_global:.2f}"
         cv2.putText(panel, gtxt, (pw // 2 - 30, y0 + 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
@@ -505,11 +481,9 @@ def draw_panel(ph, pw, infos, full_trails, display_trails, cohesion_data, tl=40)
                         (4, y0 + 44),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80, 80, 80), 1)
 
-        # ── Per-shark mini bars
         bar_y = y0 + 56
         bar_h = 8
         max_bar_w = pw - 20
-        # Scale: cohesion=0 → full bar, cohesion=max_display → empty
         max_display = max(coh_per.values()) * 1.2 if coh_per else 1.0
         max_display = max(max_display, 0.01)
 
@@ -528,7 +502,6 @@ def draw_panel(ph, pw, infos, full_trails, display_trails, cohesion_data, tl=40)
         cv2.putText(panel, "N/A (<2 sharks)", (10, y0 + 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
 
-    # Separator
     cv2.line(panel, (0, y0 + cohe_h), (pw, y0 + cohe_h), (50, 50, 50), 2)
 
     # ══════════════════════════════════════════════════════════════════
@@ -598,16 +571,18 @@ def draw_panel(ph, pw, infos, full_trails, display_trails, cohesion_data, tl=40)
 # ── CSV export ───────────────────────────────────────────────────────
 
 def export_csvs(tracks, angles, output_prefix):
-    track_labels = []
+    """
+    Export angle CSVs.  Column names = track["id"] (e.g. "shark_3").
+    """
+    track_ids = [t["id"] for t in tracks]
     all_frames = set()
-    for ti, t in enumerate(tracks):
-        ids = t["id"]
-        track_labels.append(ids)
+    for t in tracks:
         for d in t["detections"]:
             all_frames.add(d["frame"])
 
     frames_sorted = sorted(all_frames)
 
+    # Build frame → detection-index lookup per track
     frame_to_di = {}
     for ti, t in enumerate(tracks):
         lut = {}
@@ -620,7 +595,7 @@ def export_csvs(tracks, angles, output_prefix):
         path = output_prefix + suffix
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["frame"] + [f"shark_{lb}" for lb in track_labels])
+            w.writerow(["frame"] + track_ids)
             for f in frames_sorted:
                 row = [f]
                 for ti in range(len(tracks)):
@@ -647,11 +622,11 @@ def render(
     video_path, track_paths, cmc_path, cohesion_csv_path, output_path,
     trail_length=40, smooth_window=7,
     thickness=2, panel_width=300,
-    codec="mp4v", start_frame=0, end_frame=None,
+    codec="MJPG", start_frame=0, end_frame=None,
     savgol_win=51, savgol_poly=2, n_ref_frames=30,
 ):
-    raw_tracks = [load_json(p) for p in track_paths]
-    cmc = load_json(cmc_path)
+    raw_tracks = [load_track_json(p) for p in track_paths]
+    cmc = load_cmc_json(cmc_path)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -664,28 +639,33 @@ def render(
 
     print("Smoothing tracks...")
     tracks = [preprocess_track(rt, savgol_win, savgol_poly) for rt in raw_tracks]
-    for i, t in enumerate(tracks):
-        print(f"  Track {t.get('merged_track_ids', [i])}: {len(t['detections'])} dets")
+    for t in tracks:
+        print(f"  {t['id']}: {len(t['detections'])} dets")
 
     fidx = build_frame_index(tracks)
     cum_rot = build_cum_rot(cmc, start_frame, end_frame)
 
+    # ── Cohesion ─────────────────────────────────────────────────────
     print("Loading cohesion CSV...")
     cohesion_lut_raw = load_cohesion_csv(cohesion_csv_path)
     print(f"  {len(cohesion_lut_raw)} frames loaded from {cohesion_csv_path}")
 
-    # Map CSV track_ids (e.g. 3, 50) → render indices (0, 1, 2...)
-    tid_to_idx = {}
-    for ti, t in enumerate(tracks):
-        orig_id = t.get("merged_track_ids", [ti])[0]
-        tid_to_idx[orig_id] = ti
+    # Map track["id"] (e.g. "shark_3") → render index (0, 1, 2…)
+    id_to_idx = {t["id"]: ti for ti, t in enumerate(tracks)}
 
-    # Remap cohesion keys to render indices
+    # Remap cohesion CSV keys ("shark_3" etc.) to render indices
     cohesion_lut = {}
     for f, (T_val, coh_per, coh_global) in cohesion_lut_raw.items():
-        remapped = {tid_to_idx[k]: v for k, v in coh_per.items() if k in tid_to_idx}
+        remapped = {}
+        for csv_id, v in coh_per.items():          # csv_id = "shark_3"
+            if csv_id in id_to_idx:
+                remapped[id_to_idx[csv_id]] = v     # render index → value
         cohesion_lut[f] = (T_val, remapped, coh_global)
 
+    n_mapped = sum(1 for _, (_, rp, _) in cohesion_lut.items() if rp)
+    print(f"  Cohesion remapped: {n_mapped}/{len(cohesion_lut)} frames have per-shark data")
+
+    # ── Angles ───────────────────────────────────────────────────────
     print("Computing angles...")
     angles = {}
     for ti, t in enumerate(tracks):
@@ -706,6 +686,7 @@ def render(
     for ti, t in enumerate(tracks):
         det_idx[ti] = {d["frame"]: i for i, d in enumerate(t["detections"])}
 
+    # ── Render loop ──────────────────────────────────────────────────
     print("Rendering...")
     fourcc = cv2.VideoWriter_fourcc(*codec)
     writer = cv2.VideoWriter(output_path, fourcc, fps, (w + panel_width, h))
@@ -722,6 +703,7 @@ def render(
         fk = str(f)
         pinfo = []
 
+        # CMC warp display trails (accumulated — needed for stabilized view)
         if fk in cmc:
             M = np.array(cmc[fk])
             for t in dtrails:
@@ -733,9 +715,8 @@ def render(
                     pt = full_trails[t][i]
                     full_trails[t][i] = M @ np.array([pt[0], pt[1], 1.0])
 
-        # ── Cohesion from precomputed CSV
-        frame_dets = fidx.get(f, [])
         cohesion_data = cohesion_lut.get(f, (None, {}, None))
+        frame_dets = fidx.get(f, [])
 
         for ti, det in frame_dets:
             col = get_color(ti)
@@ -762,15 +743,20 @@ def render(
                 acol = tuple(c_ // 2 for c_ in col) if not has_obb else col
                 draw_arrow(frame, c, ad["angle_img"][di], acol, 60, thickness)
 
-            ids = trk.get("merged_track_ids", [])
-            label = f"IDs {ids}" if len(ids) > 1 else f"ID {ids[0]}"
+            # ── Label = track file stem (e.g. "shark_3") ──
+            label = trk["id"]
 
             info = {"label": label, "color": col, "track_idx": ti, "delta": None}
             if di is not None and not np.isnan(ad["delta_abs"][di]):
                 info["delta"] = float(ad["delta_abs"][di])
             pinfo.append(info)
 
-        panel = draw_panel(h, panel_width, pinfo, full_trails, dtrails, cohesion_data, trail_length)
+            # Draw label on frame
+            cx_i, cy_i = int(c[0]), int(c[1])
+            cv2.putText(frame, label, (cx_i + 8, cy_i - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+
+        panel = draw_panel(h, panel_width, pinfo, full_trails, cohesion_data)
         cv2.line(panel, (0, 0), (0, h), (60, 60, 60), 1)
         combined = np.hstack([frame, panel])
         cv2.putText(combined, f"Frame {f}",

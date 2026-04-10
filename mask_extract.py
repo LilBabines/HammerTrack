@@ -331,20 +331,17 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
         dst = os.path.join(CHUNK_FRAMES_DIR, f"{i:06d}.jpg")
         os.symlink(os.path.abspath(src), dst)
 
-    # Trouver les tracks actifs dans ce chunk
-    chunk_track_prompts = {}
+    # Trouver les tracks actifs dans ce chunk (au moins 1 détection réelle)
+    active_tids = []
     for tid, t in tracks.items():
-        first_det = next(
-            ((offset, t["det_by_frame"][chunk_start + offset])
-             for offset in range(chunk_len)
-             if chunk_start + offset in t["det_by_frame"]
-             and not t["det_by_frame"][chunk_start + offset].get("interpolated", False)),
-            None,
+        has_real = any(
+            chunk_start + offset in t["det_by_frame"]
+            and not t["det_by_frame"][chunk_start + offset].get("interpolated", False)
+            for offset in range(chunk_len)
         )
-        if first_det:
-            chunk_track_prompts[tid] = first_det
+        if has_real:
+            active_tids.append(tid)
 
-    active_tids = list(chunk_track_prompts.keys())
     print(f"  {len(active_tids)} active tracks")
 
     # Chunk sans tracks actifs
@@ -363,7 +360,7 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
     batches = [active_tids[i:i + MAX_TRACKS_PER_BATCH]
                for i in range(0, len(active_tids), MAX_TRACKS_PER_BATCH)]
 
-    chunk_results = defaultdict(dict)  # local_idx -> {tid -> (binary_mask, mask_score)}
+    chunk_results = defaultdict(dict)
 
     for batch_idx, batch_tids in enumerate(batches):
         print(f"  Batch {batch_idx + 1}/{len(batches)}: tracks {batch_tids}")
@@ -376,22 +373,37 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
         )
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            # Prompt chaque track du batch
-            for tid in batch_tids:
-                local_idx, det = chunk_track_prompts[tid]
-                x1, y1, x2, y2 = det["bbox"]
-                cx, cy = det["centroid"]
-                sam2_id = batch_tids.index(tid) + 1
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=local_idx,
-                    obj_id=sam2_id,
-                    box=np.array([x1*scale_x, y1*scale_y, x2*scale_x, y2*scale_y], dtype=np.float32),
-                    points=np.array([[cx*scale_x, cy*scale_y]], dtype=np.float32),
-                    labels=np.array([1], dtype=np.int32),
-                )
 
-            # Propager
+            # ═══════════════════════════════════════════════════════════
+            # CHANGEMENT PRINCIPAL : prompter TOUTES les détections
+            # réelles du chunk AVANT la propagation.
+            # ═══════════════════════════════════════════════════════════
+            prompt_count = 0
+            for local_idx in range(chunk_len):
+                gi = chunk_start + local_idx
+                for tid in batch_tids:
+                    det = tracks[tid]["det_by_frame"].get(gi)
+                    if det and not det.get("interpolated", False):
+                        sam2_id = batch_tids.index(tid) + 1
+                        x1, y1, x2, y2 = det["bbox"]
+                        cx, cy = det["centroid"]
+                        predictor.add_new_points_or_box(
+                            inference_state=inference_state,
+                            frame_idx=local_idx,
+                            obj_id=sam2_id,
+                            box=np.array([x1*scale_x, y1*scale_y,
+                                          x2*scale_x, y2*scale_y], dtype=np.float32),
+                            points=np.array([[cx*scale_x, cy*scale_y]], dtype=np.float32),
+                            labels=np.array([1], dtype=np.int32),
+                        )
+                        prompt_count += 1
+
+            print(f"    {prompt_count} prompts added before propagation")
+
+            # ═══════════════════════════════════════════════════════════
+            # Propagation — le re-prompt réactif reste en filet de
+            # sécurité pour les frames sans détection tracker.
+            # ═══════════════════════════════════════════════════════════
             for local_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
                 gi = chunk_start + local_idx
                 for i, sam2_id in enumerate(obj_ids):
@@ -400,23 +412,32 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
                     mask_score = mask_probs.max().item()
                     binary_mask = (mask_probs[0] > 0.5).cpu().numpy().astype(np.uint8)
 
+                    # Re-prompt réactif : uniquement si score bas ET
+                    # pas déjà prompté (= frame interpolée ou sans det)
                     if mask_score < MASK_CONFIDENCE_THRESHOLD:
                         det = tracks[tid]["det_by_frame"].get(gi)
-                        if det and not det.get("interpolated", False):
+                        already_prompted = (
+                            det is not None
+                            and not det.get("interpolated", False)
+                        )
+                        if det and not already_prompted:
+                            # Frame interpolée mais on a quand même une bbox
                             bx1, by1, bx2, by2 = det["bbox"]
                             bcx, bcy = det["centroid"]
                             predictor.add_new_points_or_box(
                                 inference_state=inference_state,
                                 frame_idx=local_idx,
                                 obj_id=sam2_id,
-                                box=np.array([bx1*scale_x, by1*scale_y, bx2*scale_x, by2*scale_y], dtype=np.float32),
+                                box=np.array([bx1*scale_x, by1*scale_y,
+                                              bx2*scale_x, by2*scale_y], dtype=np.float32),
                                 points=np.array([[bcx*scale_x, bcy*scale_y]], dtype=np.float32),
                                 labels=np.array([1], dtype=np.int32),
                             )
                             reprompt_count += 1
 
                     if binary_mask.shape[:2] != (h, w):
-                        binary_mask = cv2.resize(binary_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                        binary_mask = cv2.resize(binary_mask, (w, h),
+                                                 interpolation=cv2.INTER_NEAREST)
 
                     chunk_results[local_idx][tid] = (binary_mask, mask_score)
 

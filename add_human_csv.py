@@ -1,8 +1,8 @@
 import pandas as pd
 
 # === CONFIGURATION ===
-INPUT_CSV = "projects/hammer/exports/2021_114/more_tracks_angle_image.csv"
-OUTPUT_CSV = "projects/hammer/exports/2021_114/angle_image.csv"
+INPUT_CSV = "projects/hammer/exports/2021_114/cohesion_results.csv"
+OUTPUT_CSV = "projects/hammer/exports/2021_114/cohesion_results_human.csv"
 FPS = 30
 
 # Plages de temps (en secondes) où human_interaction = 1

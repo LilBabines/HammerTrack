@@ -77,7 +77,7 @@ def compute_single_frame(frame: int, frame_index: dict, track_ids: list) -> dict
             if tj != tid
         ]
 
-        ci = float(np.median(dists)) / T if (dists and T > 0) else np.nan
+        ci = float(np.quantile(dists,0.25)) / T if (dists and T > 0) else np.nan
         row[f"shark_{tid}"] = round(ci, 4) if not np.isnan(ci) else np.nan
 
         if not np.isnan(ci):

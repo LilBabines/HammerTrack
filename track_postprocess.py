@@ -356,7 +356,7 @@ TRACK_COLORS = [
 
 def render_tracks_on_video(
     video_path: str,
-    all_merged: list[tuple[list[int], MergedTrack]],
+    all_merged: list[tuple[str, list[int], MergedTrack]],
     output_path: str,
     trail_length: int = 30,
     draw_bbox: bool = True,
@@ -379,7 +379,7 @@ def render_tracks_on_video(
     out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
     frame_index: dict[int, list[tuple[int, Detection]]] = defaultdict(list)
-    for tidx, (group, merged) in enumerate(all_merged):
+    for tidx, (name, group, merged) in enumerate(all_merged):
         for f, det in merged.detections.items():
             frame_index[f].append((tidx, det))
 
@@ -431,8 +431,8 @@ def render_tracks_on_video(
                 cv2.circle(frame, (cx, cy), radius, color, -1, cv2.LINE_AA)
 
             if draw_label:
-                group_ids = all_merged[tidx][0]
-                label = f"ID {group_ids[0]}"
+                # ── Utilise le nom de fichier comme label ──
+                label = all_merged[tidx][0]
                 if is_interp:
                     label += " (interp)"
                 cv2.putText(
@@ -475,10 +475,6 @@ def _draw_dashed_rect(img, pt1, pt2, color, thickness=1, dash_len=8):
 # ── CMC helpers ──────────────────────────────────────────────────────
 
 def build_cum_affine(cmc, start, end):
-    """
-    cum[f] = 2×3 affine:  ref (frame start) → frame f.
-    To warp a point from frame f to ref: use the inverse.
-    """
     cum = {}
     M_acc = np.eye(3, dtype=np.float64)
     for f in range(start, end):
@@ -492,7 +488,6 @@ def build_cum_affine(cmc, start, end):
 
 
 def warp_point_to_ref(pt, cum_affine_f):
-    """Frame f image-space → ref space (inverse of cum_affine_f)."""
     A = np.eye(3, dtype=np.float64)
     A[:2, :] = cum_affine_f
     A_inv = np.linalg.inv(A)
@@ -501,8 +496,7 @@ def warp_point_to_ref(pt, cum_affine_f):
 
 
 def warp_point_from_ref(pt, cum_affine_f):
-    """Ref space → frame f image-space (forward of cum_affine_f)."""
-    A = cum_affine_f  # 2×3
+    A = cum_affine_f
     return A @ np.array([pt[0], pt[1], 1.0])
 
 
@@ -527,10 +521,10 @@ if __name__ == "__main__":
         [3, 50],
         [12,  177, 243, 256],
         [5, 77],
-        [13, 116, 155], 
-        [18, 161, 186, 301, 332, 348, 384, 416, 477],
+        [13, 116, 155],
+        [18, 161, 186, 301, 332, 348, 384, 477],
         [10],
-        [9, 120],  
+        [9, 120],
         [25, 78],
         [31],
         [23, 306, 361, 615],
@@ -542,7 +536,7 @@ if __name__ == "__main__":
         [24,51,63,67,121,128,133,142,168,252,275,364,365],
         [241,438],
         [212,395],
-        [213,380,388,425,474],
+        [213,380],
         [38],
         [4,70,88],
         [40],
@@ -551,14 +545,14 @@ if __name__ == "__main__":
         [110],
         [134,162,174,191],
         [137,148],
-        [163,172,189,258],
+        [163,172,189,285],
         [166,176,233],
         [180,235,250,254],
         [202,229,249,277,313],
-        [407,414],
+        [407,414,654],
         [181,228],
         [195,253,288,340,421],
-        [198],
+        [198,263,297],
         [224],[225,374],
         [240],
         [209,310,325],
@@ -567,54 +561,87 @@ if __name__ == "__main__":
         [319],
         [323],
         [327],
+        [337],
         [345],
         [317],
-        [347],
         [377],
         [379,458],
         [387,417,432],
-    ]  
+        [359,376,388,425,474],
+        [386,433],
+        [443],
+        [462,496],
+        [453,515],
+        [488],
+        [490],
+        [491,534,548,584,597],
+        [494],
+        [416],
+        [481],
+        [484],
+        [495,513],
+        [498,541,543,554,660],
+        [499],
+        [502,520],
+        [503,588],
+        [383,422],
+        [493,521,564,596,604,611,667],
+        [392,401,402],
+        [430,440],
+        [435],
+        [434,455],
+        [492,512,518,528,533,538,542,558,562,624],
+        [547,568],
+        [629,669],
+        [390,394,400,406,420],
+        [549,559,581,658],
+        [552,576],
+        [578,595],
+        [347,544,603,619,663,671],
+        [553,587,661],
+        [586,620],
+        [589],
+        [556,599],
+        [630,655],
+        [632,637],
+        [618,646]
+    ]
     flat = [x for sub in groups for x in sub]
     has_duplicates = len(flat) != len(set(flat))
     from collections import Counter
     dupes = [x for x, c in Counter(flat).items() if c > 1]
     print(dupes)
-    assert len(dupes)==0
+    assert len(dupes) == 0
 
-    all_merged: list[tuple[list[int], MergedTrack]] = []
+    all_merged: list[tuple[str, list[int], MergedTrack]] = []
 
-    for num_i,group in enumerate(groups):
+    for num_i, group in enumerate(groups):
         if not group:
             continue
 
-        # Merge (Kalman-tail aware, CMC-aware gap interpolation)
         merged = merge_tracks(tracks, track_ids=group, cum_affines=cum_affines)
         print(f"Track group {group}: {len(merged.detections)} detections after merge")
 
-        # Remove outliers
         merged = remove_outliers(merged, max_jump_px=150, method="jump")
         print(f"  After outlier removal: {len(merged.detections)}")
 
-        # Interpolate remaining missing frames (CMC-aware)
         merged = interpolate_missing(merged, method="linear", cum_affines=cum_affines)
         print(f"  After interpolation: {len(merged.detections)}")
 
-        # Smooth
         merged = smooth_centroids(merged, method="savgol", window=7, polyorder=2)
 
-        # Export JSON
-        # tag = "_".join(str(i) for i in group)
-        tag = num_i
-        export_merged(merged, f"projects/hammer/exports/2021_114/postp_tracks/shark_{tag}.json")
+        # ── Le nom de fichier sert aussi de label dans le rendu ──
+        filename = f"shark_{num_i}"
+        export_merged(merged, f"projects/hammer/exports/2021_114/postp_tracks/{filename}.json")
 
-        all_merged.append((group, merged))
+        all_merged.append((filename, group, merged))
 
-    # # 3. Render toutes les tracks sur la vidéo
+    # 3. Render toutes les tracks sur la vidéo
     render_tracks_on_video(
         video_path="clips/selected/SIMP2021_114-00-08_06.mp4",
         all_merged=all_merged,
-        output_path="projects/hammer/exports/2021_114/overlay_pp.mp4",
-        trail_length=10 ,
+        output_path="projects/hammer/exports/2021_114/overlay_pp_64.mp4",
+        trail_length=10,
         draw_bbox=False,
         draw_obb=True,
         draw_centroid=True,
