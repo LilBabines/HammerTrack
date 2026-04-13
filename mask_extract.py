@@ -1,19 +1,22 @@
 import os
+import sys
+import argparse
 import subprocess
 import json
 import csv
 import glob
 import shutil
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 import cv2
 from sam2.build_sam import build_sam2_video_predictor
+from skimage.morphology import skeletonize
 
 # --- Config ---
 VIDEO_PATH = "clips/selected/SIMP2021_057-13_10-16_25.mp4"
-OUTPUT_PATH = "projects/hammer/exports/2021_057/output_masked.mp4"
+OUTPUT_PATH = "projects/hammer/exports/2021_057/display_skeleton_5_points.mp4"
 FRAMES_DIR = "clips/by_frames/SIMP2021_057"
 CSV_OUTPUT_DIR = "projects/hammer/exports/2021_057/keypoints/"
 
@@ -46,12 +49,19 @@ TRACK_COLORS = [
     (255, 50, 128), (128, 50, 200), (50, 255, 128), (200, 255, 50),
 ]
 
+ANGLE_NAMES = [
+    "angle_head_com_tail", "angle_head_com_art1", "angle_head_com_art2",
+    "angle_com_art1", "angle_com_art2",
+    "angle_art1_art2", "angle_art1_tail", "angle_art2_tail",
+]
+csv_header = [
+    "frame", "head_x", "head_y", "com_x", "com_y",
+    "art1_x", "art1_y", "art2_x", "art2_y",
+    "tail_x", "tail_y",
+] + ANGLE_NAMES
 
-# =============================================================================
-# Fonctions de calcul
-# =============================================================================
 
-def extract_keypoints(binary_mask):
+def extract_keypoints_basic(binary_mask):
     """Extrait head (milieu du cephalofoil), COM, art1, art2, tail."""
     contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
@@ -64,6 +74,14 @@ def extract_keypoints(binary_mask):
         return None
 
     com = np.array([M["m10"] / M["m00"], M["m01"] / M["m00"]])
+
+    skeleton = skeletonize(binary_mask.astype(bool))
+    skel_pts = np.argwhere(skeleton)  # (y, x)
+    if len(skel_pts) > 0:
+        dists = np.linalg.norm(skel_pts - np.array([com[1], com[0]]), axis=1)
+        nearest = skel_pts[dists.argmin()]
+        com = np.array([nearest[1], nearest[0]])
+
     pts = contour.reshape(-1, 2).astype(np.float64)
 
     # Tail = point le plus loin du COM
@@ -119,7 +137,6 @@ def extract_keypoints(binary_mask):
         else:
             articulations.append(com + body_vec * frac)
 
-    # Angle head->COM->tail
     v1 = com - head
     v2 = tail - com
     angle = np.arctan2(v2[1], v2[0]) - np.arctan2(v1[1], v1[0])
@@ -139,21 +156,73 @@ def extract_keypoints(binary_mask):
     return result
 
 
-def compute_angles(kp):
-    """Calcule les 3 angles des vecteurs vers la queue."""
+def compute_angles_basic(kp):
+    """Calcule 6 angles : 1 articulaire (head_com_tail) + 5 directionnels."""
+    head = np.array([kp["head_x"], kp["head_y"]])
+    com  = np.array([kp["com_x"],  kp["com_y"]])
+    a1   = np.array([kp["art1_x"], kp["art1_y"]])
+    a2   = np.array([kp["art2_x"], kp["art2_y"]])
     tail = np.array([kp["tail_x"], kp["tail_y"]])
-    com = np.array([kp["com_x"], kp["com_y"]])
-    a1 = np.array([kp["art1_x"], kp["art1_y"]])
-    a2 = np.array([kp["art2_x"], kp["art2_y"]])
-    def vec_angle(o, t):
-        v = t - o
+
+    def vec_angle(origin, target):
+        v = target - origin
         return np.arctan2(v[1], v[0])
+
+    v1 = head - com
+
+    v2 = tail - com
+    a = np.arctan2(v2[1], v2[0]) - np.arctan2(v1[1], v1[0])
+    angle_head_com_tail = (a + np.pi) % (2 * np.pi) - np.pi
+
+    v2_2 = a1 - com
+    a = np.arctan2(v2_2[1], v2_2[0]) - np.arctan2(v1[1], v1[0])
+    angle_head_com_art1 = (a + np.pi) % (2 * np.pi) - np.pi
+
+
+
+    v2_3 = a2 - com
+    a = np.arctan2(v2_3[1], v2_3[0]) - np.arctan2(v1[1], v1[0])
+    angle_head_com_art2 = (a + np.pi) % (2 * np.pi) - np.pi
+    
+    
     return {
-        "com_tail": vec_angle(com, tail),
-        "art1_tail": vec_angle(a1, tail),
-        "art2_tail": vec_angle(a2, tail),
+        "angle_head_com_tail": angle_head_com_tail,
+        "angle_head_com_art1":angle_head_com_art1,
+        "angle_head_com_art2": angle_head_com_art2,
+        "angle_com_art1":      vec_angle(com, a1),
+        "angle_com_art2":      vec_angle(com, a2),
+        "angle_art1_art2":     vec_angle(a1, a2),
+        "angle_art1_tail":     vec_angle(a1, tail),
+        "angle_art2_tail":     vec_angle(a2, tail),
     }
 
+
+
+
+
+def build_csv_row(frame_idx, kp, angles):
+    """Construit la ligne CSV selon le mode."""
+    
+    return [
+        frame_idx,
+        f"{kp['head_x']:.2f}", f"{kp['head_y']:.2f}",
+        f"{kp['com_x']:.2f}", f"{kp['com_y']:.2f}",
+        f"{kp['art1_x']:.2f}", f"{kp['art1_y']:.2f}",
+        f"{kp['art2_x']:.2f}", f"{kp['art2_y']:.2f}",
+        f"{kp['tail_x']:.2f}", f"{kp['tail_y']:.2f}",
+        f"{angles['angle_head_com_tail']:.4f}",
+        f"{angles['angle_head_com_art1']:.4f}",
+        f"{angles['angle_head_com_art2']:.4f}",
+        f"{angles['angle_com_art1']:.4f}",
+        f"{angles['angle_com_art2']:.4f}",
+        f"{angles['angle_art1_art2']:.4f}",
+        f"{angles['angle_art1_tail']:.4f}",
+        f"{angles['angle_art2_tail']:.4f}",
+    ]
+# ==========
+# ===================================================================
+# Fonctions communes
+# =============================================================================
 
 def process_track_mask(args):
     """Calcule keypoints + angles pour un track (exécuté en thread)."""
@@ -161,64 +230,170 @@ def process_track_mask(args):
     mask_pixels = binary_mask.sum()
     if mask_pixels == 0:
         return tid, 0, None, None
-    kp = extract_keypoints(binary_mask)
-    angles = compute_angles(kp) if kp else None
+    kp = extract_keypoints_basic(binary_mask)
+    angles = compute_angles_basic(kp) if kp else None
     return tid, mask_pixels, kp, angles
 
 
-def draw_graph(angle_buffers, track_colors, fps):
-    """Dessine le graphique art2_tail pour chaque track."""
-    graph = np.zeros((GRAPH_H, GRAPH_W, 3), dtype=np.uint8)
-    graph[:] = (30, 30, 30)
-    gx0, gx1 = GRAPH_MARGIN, GRAPH_W - 10
-    gy0, gy1 = 10, GRAPH_H - GRAPH_MARGIN
-    gw, gh = gx1 - gx0, gy1 - gy0
+def draw_skeleton_on_frame(frame, kp, color, w):
+    """Dessine le squelette sur la frame selon le mode."""
+    radius = max(6, int(w / 400))
+    thickness = max(2, int(w / 800))
 
+
+    hpt = (int(kp["head_x"]), int(kp["head_y"]))
+    cpt = (int(kp["com_x"]), int(kp["com_y"]))
+    a1pt = (int(kp["art1_x"]), int(kp["art1_y"]))
+    a2pt = (int(kp["art2_x"]), int(kp["art2_y"]))
+    tpt = (int(kp["tail_x"]), int(kp["tail_y"]))
+
+    cv2.drawMarker(frame, hpt, color, cv2.MARKER_CROSS, radius * 2, thickness)
+    if "head_p1" in kp:
+        cv2.line(frame, kp["head_p1"], kp["head_p2"], color, thickness)
+        cv2.circle(frame, kp["head_p1"], radius, color, -1)
+        cv2.circle(frame, kp["head_p2"], radius, color, -1)
+    cv2.circle(frame, cpt, radius, (255, 255, 255), thickness)
+    cv2.drawMarker(frame, a1pt, color, cv2.MARKER_DIAMOND, radius * 2, thickness)
+    cv2.drawMarker(frame, a2pt, color, cv2.MARKER_DIAMOND, radius * 2, thickness)
+    cv2.drawMarker(frame, tpt, color, cv2.MARKER_TRIANGLE_UP, radius * 2, thickness)
+    cv2.line(frame, hpt, cpt, color, thickness)
+    cv2.line(frame, cpt, a1pt, color, thickness)
+    cv2.line(frame, a1pt, a2pt, color, thickness)
+    cv2.line(frame, a2pt, tpt, color, thickness)
+
+    
+            
+def draw_graph(angle_buffers, track_colors, fps, graph_h):
+    """Dessine un graphe unique par domaine, courbes superposées."""
+    graph = np.zeros((graph_h, GRAPH_W, 3), dtype=np.uint8)
+    graph[:] = (30, 30, 30)
+
+    domains = _build_basic_domains()
+
+    _draw_domain_plots(graph, domains, angle_buffers, track_colors, fps, graph_h)
+    return graph
+
+
+def _build_basic_domains():
+
+    # Exemple : 2 domaines de 3 angles chacun
+    group1 = [
+        ("angle_head_com_tail", "head-com-tail", (255, 200, 50)),
+        ("angle_head_com_art1", "head-com-art1", (100, 200, 255)),
+        ("angle_head_com_art2", "head-com-art2", (255, 100, 150)),
+    ]
+    group2 =  [
+        ("angle_art1_tail", "head-art1-tail", (100, 255, 150)),
+        ("angle_com_art1", "head-com-art1", (255, 130, 80)),
+        ("angle_com_art2", "head-com-art2", (180, 130, 255)),
+    ]
+    return [
+        {"title": "Angles (group 1)", "curves": group1},
+        {"title": "Angles (group 2)", "curves": group2},
+    ]
+
+
+
+
+def _draw_subplot(graph, title, curves, angle_buffers, track_colors, fps,
+                  gx0, gy0, gx1, gy1, cx0):
+    """Dessine un subplot avec N courbes superposées (tous tracks)."""
+    gw, gh = gx1 - gx0, gy1 - gy0
+    if gw < 10 or gh < 10:
+        return
+
+    # Titre
+    cv2.putText(graph, title, (gx0, gy0 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1)
+
+    # Collecter toutes les valeurs pour l'échelle Y commune
     all_vals = []
-    for buf in angle_buffers.values():
-        all_vals.extend([e["art2_tail"] for e in buf])
+    for key, label, color in curves:
+        for buf in angle_buffers.values():
+            all_vals.extend([e[key] for e in buf if key in e])
     if len(all_vals) < 2:
-        return graph
+        return
 
     y_min, y_max = min(all_vals) - 0.1, max(all_vals) + 0.1
     if y_max - y_min < 0.2:
         y_min -= 0.1
         y_max += 0.1
 
-    zero_y = int(gy0 + gh * (1 - (0 - y_min) / (y_max - y_min)))
-    if gy0 < zero_y < gy1:
-        cv2.line(graph, (gx0, zero_y), (gx1, zero_y), (80, 80, 80), 1)
+    # Cadre
+    cv2.rectangle(graph, (gx0, gy0), (gx1, gy1), (60, 60, 60), 1)
 
-    for val in np.linspace(y_min, y_max, 5):
+    # Ligne du zéro
+    if y_min < 0 < y_max:
+        zy = int(gy0 + gh * (1 - (0 - y_min) / (y_max - y_min)))
+        cv2.line(graph, (gx0, zy), (gx1, zy), (80, 80, 80), 1)
+
+    # Labels Y
+    for val in np.linspace(y_min, y_max, 4):
         py = int(gy0 + gh * (1 - (val - y_min) / (y_max - y_min)))
-        cv2.putText(graph, f"{val:.1f}", (2, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+        cv2.putText(graph, f"{val:.1f}", (cx0 + 2, py + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (120, 120, 120), 1)
 
+    # Labels X
     max_n = max((len(b) for b in angle_buffers.values()), default=1)
     max_time = max_n / fps
-    for t in range(0, int(max_time) + 1):
+    for t in range(0, int(max_time) + 1, max(1, int(max_time) // 4)):
         px = int(gx0 + gw * t / max(max_time, 0.1))
         if px <= gx1:
-            cv2.putText(graph, f"{t}s", (px - 5, GRAPH_H - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+            cv2.putText(graph, f"{t}s", (px - 5, gy1 + 13),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (120, 120, 120), 1)
 
-    lx, ly = gx0 + 5, gy0 + 15
-    for tid, buf in angle_buffers.items():
-        if len(buf) < 2:
-            continue
-        color = track_colors[tid]
-        n = len(buf)
-        points = []
-        for i, entry in enumerate(buf):
-            px = int(gx0 + gw * i / (n - 1))
-            val = entry["art2_tail"]
-            py = int(gy0 + gh * (1 - (val - y_min) / (y_max - y_min)))
-            points.append((px, py))
-        for i in range(len(points) - 1):
-            cv2.line(graph, points[i], points[i + 1], color, 2)
-        cv2.line(graph, (lx, ly), (lx + 20, ly), color, 2)
-        cv2.putText(graph, f"T{tid}", (lx + 25, ly + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        ly += 18
+    # Courbes
+    for key, label, curve_color in curves:
+        for tid, buf in angle_buffers.items():
+            if len(buf) < 2:
+                continue
+            # Mélanger couleur courbe + couleur track
+            tc = track_colors[tid]
+            mix = (
+                int(curve_color[0] * 0.6 + tc[0] * 0.4),
+                int(curve_color[1] * 0.6 + tc[1] * 0.4),
+                int(curve_color[2] * 0.6 + tc[2] * 0.4),
+            )
+            n = len(buf)
+            points = []
+            for i, entry in enumerate(buf):
+                if key not in entry:
+                    continue
+                px = int(gx0 + gw * i / (n - 1))
+                val = entry[key]
+                py = int(gy0 + gh * (1 - (val - y_min) / (y_max - y_min)))
+                points.append((px, py))
+            for i in range(len(points) - 1):
+                cv2.line(graph, points[i], points[i + 1], mix, 2)
 
-    return graph
+    # Légende des courbes dans le subplot
+    lx = gx1 - 80
+    ly = gy0 + 12
+    for key, label, curve_color in curves:
+        cv2.line(graph, (lx, ly), (lx + 15, ly), curve_color, 2)
+        cv2.putText(graph, label, (lx + 18, ly + 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, curve_color, 1)
+        ly += 12
+
+
+
+def _draw_domain_plots(graph, domains, angle_buffers, track_colors, fps, graph_h):
+    """Un subplot par domaine, empilés verticalement."""
+    pad_x, pad_y = 5, 5
+    # n_plots = len(domains)
+    n_plots = 3
+    cell_h = (graph_h - 2 * pad_y) // n_plots
+    margin_l, margin_b, margin_t = 40, 18, 18
+
+    for idx, domain in enumerate(domains):
+        cy0 = pad_y + idx * cell_h
+        gx0 = pad_x + margin_l
+        gy0 = cy0 + margin_t
+        gx1 = GRAPH_W - 8
+        gy1 = cy0 + cell_h - margin_b
+        _draw_subplot(graph, domain["title"], domain["curves"],
+                      angle_buffers, track_colors, fps,
+                      gx0, gy0, gx1, gy1, pad_x)
 
 
 def send_to_display(canvas):
@@ -236,7 +411,6 @@ def send_to_display(canvas):
 # Setup
 # =============================================================================
 
-# --- Video info ---
 cap = cv2.VideoCapture(VIDEO_PATH)
 fps = int(cap.get(cv2.CAP_PROP_FPS))
 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -272,14 +446,8 @@ for tid, path in enumerate(TRACK_FILES):
 
 track_colors = {tid: t["color"] for tid, t in tracks.items()}
 
-# --- CSV : un fichier par track ---
+# --- CSV ---
 os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
-csv_header = [
-    "frame", "head_x", "head_y", "com_x", "com_y",
-    "art1_x", "art1_y", "art2_x", "art2_y",
-    "tail_x", "tail_y",
-    "angle_rad", "angle_com_tail", "angle_art1_tail", "angle_art2_tail",
-]
 csv_files = {}
 csv_writers = {}
 for tid, path in enumerate(TRACK_FILES):
@@ -305,7 +473,6 @@ ffplay_proc = subprocess.Popen(
 )
 display_alive = True
 
-# --- Thread pool ---
 thread_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
 
@@ -316,6 +483,7 @@ thread_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 reprompt_count = 0
 max_buffer = int(fps * GRAPH_SECONDS)
 angle_buffers = {tid: [] for tid in tracks}
+latest_kp = {tid: None for tid in tracks}  # pour la vue squelette normalisée
 
 for chunk_start in range(0, total_frames, CHUNK_SIZE):
     chunk_end = min(chunk_start + CHUNK_SIZE, total_frames)
@@ -331,7 +499,6 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
         dst = os.path.join(CHUNK_FRAMES_DIR, f"{i:06d}.jpg")
         os.symlink(os.path.abspath(src), dst)
 
-    # Trouver les tracks actifs dans ce chunk (au moins 1 détection réelle)
     active_tids = []
     for tid, t in tracks.items():
         has_real = any(
@@ -344,19 +511,18 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
 
     print(f"  {len(active_tids)} active tracks")
 
-    # Chunk sans tracks actifs
     if not active_tids:
         for i in range(chunk_len):
             gi = chunk_start + i
             frame = cv2.imread(os.path.join(FRAMES_DIR, f"{gi:06d}.jpg"))
             canvas = np.zeros((h, canvas_w, 3), dtype=np.uint8)
             canvas[:, :w] = frame
-            canvas[h - GRAPH_H:, w:] = draw_graph(angle_buffers, track_colors, fps)
+            
+            canvas[:, w:] = draw_graph(angle_buffers, track_colors, fps, h)
             writer.write(canvas)
             send_to_display(canvas)
         continue
 
-    # Traiter par sous-groupes
     batches = [active_tids[i:i + MAX_TRACKS_PER_BATCH]
                for i in range(0, len(active_tids), MAX_TRACKS_PER_BATCH)]
 
@@ -374,10 +540,6 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
 
-            # ═══════════════════════════════════════════════════════════
-            # CHANGEMENT PRINCIPAL : prompter TOUTES les détections
-            # réelles du chunk AVANT la propagation.
-            # ═══════════════════════════════════════════════════════════
             prompt_count = 0
             for local_idx in range(chunk_len):
                 gi = chunk_start + local_idx
@@ -400,10 +562,6 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
 
             print(f"    {prompt_count} prompts added before propagation")
 
-            # ═══════════════════════════════════════════════════════════
-            # Propagation — le re-prompt réactif reste en filet de
-            # sécurité pour les frames sans détection tracker.
-            # ═══════════════════════════════════════════════════════════
             for local_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
                 gi = chunk_start + local_idx
                 for i, sam2_id in enumerate(obj_ids):
@@ -412,8 +570,6 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
                     mask_score = mask_probs.max().item()
                     binary_mask = (mask_probs[0] > 0.5).cpu().numpy().astype(np.uint8)
 
-                    # Re-prompt réactif : uniquement si score bas ET
-                    # pas déjà prompté (= frame interpolée ou sans det)
                     if mask_score < MASK_CONFIDENCE_THRESHOLD:
                         det = tracks[tid]["det_by_frame"].get(gi)
                         already_prompted = (
@@ -421,7 +577,6 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
                             and not det.get("interpolated", False)
                         )
                         if det and not already_prompted:
-                            # Frame interpolée mais on a quand même une bbox
                             bx1, by1, bx2, by2 = det["bbox"]
                             bcx, bcy = det["centroid"]
                             predictor.add_new_points_or_box(
@@ -450,7 +605,7 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
         frame = cv2.imread(os.path.join(FRAMES_DIR, f"{gi:06d}.jpg"))
         frame_tracks = chunk_results.get(local_idx, {})
 
-        # 1) Appliquer tous les masques
+        # 1) Masques
         for tid, (binary_mask, mask_score) in frame_tracks.items():
             if binary_mask.sum() > 0:
                 overlay = frame.copy()
@@ -459,7 +614,7 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
                 contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(frame, contours, -1, tracks[tid]["color"], CONTOUR_THICKNESS)
 
-        # 2) Calculer keypoints en parallèle
+        # 2) Keypoints en parallèle
         tasks = [(tid, binary_mask) for tid, (binary_mask, _) in frame_tracks.items()]
         results = list(thread_pool.map(process_track_mask, tasks))
 
@@ -469,52 +624,26 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
                 continue
             color = tracks[tid]["color"]
 
-            csv_writers[tid].writerow([
-                gi,
-                f"{kp['head_x']:.2f}", f"{kp['head_y']:.2f}",
-                f"{kp['com_x']:.2f}", f"{kp['com_y']:.2f}",
-                f"{kp['art1_x']:.2f}", f"{kp['art1_y']:.2f}",
-                f"{kp['art2_x']:.2f}", f"{kp['art2_y']:.2f}",
-                f"{kp['tail_x']:.2f}", f"{kp['tail_y']:.2f}",
-                f"{kp['angle_rad']:.4f}",
-                f"{angles['com_tail']:.4f}",
-                f"{angles['art1_tail']:.4f}",
-                f"{angles['art2_tail']:.4f}",
-            ])
+            csv_writers[tid].writerow(build_csv_row(gi, kp, angles))
 
-            radius = max(6, int(w / 400))
-            thickness = max(2, int(w / 800))
-            font_kp = max(0.8, w / 2500)
-            hpt = (int(kp["head_x"]), int(kp["head_y"]))
-            cpt = (int(kp["com_x"]), int(kp["com_y"]))
-            a1pt = (int(kp["art1_x"]), int(kp["art1_y"]))
-            a2pt = (int(kp["art2_x"]), int(kp["art2_y"]))
-            tpt = (int(kp["tail_x"]), int(kp["tail_y"]))
-
-            cv2.drawMarker(frame, hpt, color, cv2.MARKER_CROSS, radius * 2, thickness)
-            if "head_p1" in kp:
-                cv2.line(frame, kp["head_p1"], kp["head_p2"], color, thickness)
-                cv2.circle(frame, kp["head_p1"], radius, color, -1)
-                cv2.circle(frame, kp["head_p2"], radius, color, -1)
-            cv2.circle(frame, cpt, radius, (255, 255, 255), thickness)
-            cv2.drawMarker(frame, a1pt, color, cv2.MARKER_DIAMOND, radius * 2, thickness)
-            cv2.drawMarker(frame, a2pt, color, cv2.MARKER_DIAMOND, radius * 2, thickness)
-            cv2.drawMarker(frame, tpt, color, cv2.MARKER_TRIANGLE_UP, radius * 2, thickness)
-            cv2.line(frame, hpt, cpt, color, thickness)
-            cv2.line(frame, cpt, a1pt, color, thickness)
-            cv2.line(frame, a1pt, a2pt, color, thickness)
-            cv2.line(frame, a2pt, tpt, color, thickness)
+            draw_skeleton_on_frame(frame, kp, color, w)
 
             angle_buffers[tid].append(angles)
             if len(angle_buffers[tid]) > max_buffer:
                 angle_buffers[tid].pop(0)
 
+            # Stocker les keypoints les plus récents pour la vue squelette
+            latest_kp[tid] = kp
+
         font_scale = max(1, w / 1500)
-        cv2.putText(frame, f"Frame {gi}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 3)
+        cv2.putText(frame, f"Frame {gi}", (20, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 3)
 
         canvas = np.zeros((h, canvas_w, 3), dtype=np.uint8)
         canvas[:, :w] = frame
-        canvas[h - GRAPH_H:, w:] = draw_graph(angle_buffers, track_colors, fps)
+
+        
+        canvas[:, w:] = draw_graph(angle_buffers, track_colors, fps, h)
 
         writer.write(canvas)
         send_to_display(canvas)

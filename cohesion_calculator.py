@@ -118,8 +118,8 @@ def compute_cohesion_per_frame(tracks: dict, output_path: str = "cohesion_per_fr
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     # Adapter le chemin vers le dossier contenant les JSONs
-    JSON_DIR = "projects/hammer/exports/2021_114/postp_tracks"
-    OUTPUT_CSV = "projects/hammer/exports/2021_114/cohesion_results.csv"
+    JSON_DIR = "projects/hammer/exports/2021_057/postp_tracks"
+    OUTPUT_CSV = "projects/hammer/exports/2021_057/cohesion_results.csv"
     tracks = load_tracks(JSON_DIR)
     print(f"Chargé {len(tracks)} tracks depuis {JSON_DIR}\n")
 
