@@ -32,7 +32,7 @@ except ImportError:
     YOLO = None
 
 try:
-    from boxmot import BotSort
+    from boxmot.trackers import BotSort
     BOXMOT_AVAILABLE = True
 except ImportError:
     BOXMOT_AVAILABLE = False

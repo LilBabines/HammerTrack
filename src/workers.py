@@ -17,7 +17,7 @@ except ImportError:
 from .utils import OBBOX, rect_to_poly_xyxy
 
 
-YOLO_MODEL_PATH = "./models/best26n-obb.pt"
+YOLO_MODEL_PATH = ""
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +88,10 @@ class DetectionWorker(QtCore.QObject):
             cls._model_path = model_path
             cls._model_task = getattr(cls._model, "task", "detect")
             print(f"[DetectionWorker] Model task: {cls._model_task}")
+
+        else: 
+            cls._model = YOLO("")
+
         return cls._model
 
 
