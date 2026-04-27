@@ -773,27 +773,73 @@ def render(
 
 
 if __name__ == "__main__":
-    pa = argparse.ArgumentParser(description="Render OBB + cohesion + compass")
-    pa.add_argument("video")
-    pa.add_argument("tracks", nargs="+")
-    pa.add_argument("--cmc", required=True)
-    pa.add_argument("--cohesion", required=True, help="Path to cohesion_per_frame.csv")
-    pa.add_argument("-o", "--output", default="output_angle.mp4")
-    pa.add_argument("--trail", type=int, default=120)
-    pa.add_argument("--smooth", type=int, default=120)
-    pa.add_argument("--thickness", type=int, default=3)
-    pa.add_argument("--savgol-win", type=int, default=51)
-    pa.add_argument("--savgol-poly", type=int, default=2)
-    pa.add_argument("--n-ref", type=int, default=30)
-    pa.add_argument("--panel-width", type=int, default=800)
-    pa.add_argument("--start", type=int, default=0)
-    pa.add_argument("--end", type=int, default=None)
-    pa.add_argument("--codec", default="mp4v")
-    a = pa.parse_args()
+    import glob
+    import sys
+
+    pa = argparse.ArgumentParser(
+        description=(
+            "Render an OBB + per-individual angle + group cohesion overlay on a "
+            "drone video, and export per-track angle CSVs (image-space and "
+            "stabilized/absolute angles relative to the early-frames group "
+            "reference)."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # --- I/O ---
+    pa.add_argument("--video", required=True,
+                    help="Path to the source clip (.mp4).")
+    pa.add_argument("--tracks", required=True,
+                    help="Glob pattern OR directory of post-processed track .json files.")
+    pa.add_argument("--pattern", default="*.json",
+                    help="Glob pattern used when --tracks is a directory.")
+    pa.add_argument("--cmc", required=True,
+                    help="Path to the camera-motion-compensation JSON (per-frame affine).")
+    pa.add_argument("--cohesion-csv", required=True,
+                    help="Path to the per-frame cohesion CSV produced by scripts/cohesion.py.")
+    pa.add_argument("--output-video", required=True,
+                    help="Output path for the rendered .mp4. The angle CSVs are written next "
+                         "to it as <prefix>_angle_image.csv and <prefix>_angle_absolute.csv.")
+
+    # --- Rendering ---
+    pa.add_argument("--trail", type=int, default=120,
+                    help="Length (in frames) of the centroid trail drawn on the video.")
+    pa.add_argument("--smooth", type=int, default=120,
+                    help="Window used to estimate trajectory direction from the trail.")
+    pa.add_argument("--thickness", type=int, default=3,
+                    help="Line thickness for OBB / arrows / trails.")
+    pa.add_argument("--panel-width", type=int, default=800,
+                    help="Width (px) of the right-side info panel.")
+    pa.add_argument("--codec", default="mp4v",
+                    help="FourCC codec for the output video.")
+    pa.add_argument("--start", type=int, default=0,
+                    help="First frame to render (inclusive).")
+    pa.add_argument("--end", type=int, default=None,
+                    help="Last frame to render (exclusive). Default: end of video.")
+
+    # --- Angle smoothing & reference ---
+    pa.add_argument("--savgol-win", type=int, default=51,
+                    help="Savitzky-Golay window for axis/trajectory/centroid smoothing.")
+    pa.add_argument("--savgol-poly", type=int, default=2,
+                    help="Savitzky-Golay polynomial order.")
+    pa.add_argument("--n-ref", type=int, default=30,
+                    help="Number of early frames used to build the group reference angle.")
+
+    args = pa.parse_args()
+
+    # Resolve --tracks: accept either a directory (uses --pattern) or a glob.
+    if os.path.isdir(args.tracks):
+        track_pattern = str(Path(args.tracks) / args.pattern)
+    else:
+        track_pattern = args.tracks
+    track_paths = sorted(glob.glob(track_pattern))
+    if not track_paths:
+        sys.exit(f"No track files found matching: {track_pattern}")
+    print(f"Found {len(track_paths)} tracks: {[Path(p).stem for p in track_paths]}")
 
     render(
-        a.video, a.tracks, a.cmc, a.cohesion, a.output,
-        a.trail, a.smooth, a.thickness, a.panel_width,
-        a.codec, a.start, a.end,
-        a.savgol_win, a.savgol_poly, a.n_ref,
+        args.video, track_paths, args.cmc, args.cohesion_csv, args.output_video,
+        args.trail, args.smooth, args.thickness, args.panel_width,
+        args.codec, args.start, args.end,
+        args.savgol_win, args.savgol_poly, args.n_ref,
     )
