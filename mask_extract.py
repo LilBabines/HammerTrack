@@ -15,21 +15,24 @@ from sam2.build_sam import build_sam2_video_predictor
 from skimage.morphology import skeletonize
 
 # --- Config ---
-VIDEO_PATH = "clips/selected/SIMP2021_057-13_10-16_25.mp4"
-OUTPUT_PATH = "projects/hammer/exports/2021_057/display_skeleton_5_points.mp4"
-FRAMES_DIR = "clips/by_frames/SIMP2021_057"
-CSV_OUTPUT_DIR = "projects/hammer/exports/2021_057/keypoints/"
+VIDEO_PATH = "clips/selected/SIMP2021_114-00-08_06.mp4"
+OUTPUT_PATH = "projects/hammer/exports/2021_114/display_skeleton_5_points.mp4"
+FRAMES_DIR = "clips/by_frames/SIMP2021_114"
+CSV_OUTPUT_DIR = "projects/hammer/exports/2021_114/keypoints/"
 
-TRACK_PATTERN = "projects/hammer/exports/2021_057/postp_tracks/*.json"
+TRACK_PATTERN = "projects/hammer/exports/2021_114/postp_tracks/*.json"
 TRACK_FILES = sorted(glob.glob(TRACK_PATTERN))
 print(f"Found {len(TRACK_FILES)} tracks: {[os.path.basename(f) for f in TRACK_FILES]}")
 
 SAM2_CHECKPOINT = "sam2.1_hiera_base_plus.pt"
 SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
 
-CHUNK_SIZE = 200
+PLOT_MARGIN = True       # False = pas de marge graphique (plus rapide)
+SHOW_VIDEO = True        # False = pas de fenêtre ffplay (video enregistrée quand même)
+
+CHUNK_SIZE = 100
 MASK_CONFIDENCE_THRESHOLD = 0.85
-MAX_TRACKS_PER_BATCH = 6
+MAX_TRACKS_PER_BATCH = 12
 MASK_ALPHA = 0.45
 CONTOUR_THICKNESS = 4
 
@@ -37,6 +40,7 @@ GRAPH_SECONDS = 5
 GRAPH_W = 600
 GRAPH_H = 400
 GRAPH_MARGIN = 40
+
 
 CHUNK_FRAMES_DIR = "/tmp/sam2_chunk"
 NUM_WORKERS = min(8, os.cpu_count() or 4)
@@ -399,7 +403,7 @@ def _draw_domain_plots(graph, domains, angle_buffers, track_colors, fps, graph_h
 def send_to_display(canvas):
     """Envoie une frame au processus ffplay."""
     global display_alive
-    if not display_alive:
+    if not display_alive or ffplay_proc is None:
         return
     if ffplay_proc.poll() is not None:
         display_alive = False
@@ -446,6 +450,12 @@ for tid, path in enumerate(TRACK_FILES):
 
 track_colors = {tid: t["color"] for tid, t in tracks.items()}
 
+# Track avec le plus de détections (pour PLOT_MARGIN: 1 seule track affichée)
+best_track_tid = max(tracks, key=lambda tid: sum(
+    1 for d in tracks[tid]["detections"] if not d.get("interpolated", False)
+))
+print(f"Best track for graph: {best_track_tid} ({sum(1 for d in tracks[best_track_tid]['detections'] if not d.get('interpolated', False))} real dets)")
+
 # --- CSV ---
 os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
 csv_files = {}
@@ -460,18 +470,21 @@ for tid, path in enumerate(TRACK_FILES):
     csv_writers[tid] = w_csv
 
 # --- Video writer ---
-canvas_w = w + GRAPH_W
+canvas_w = w + GRAPH_W if PLOT_MARGIN else w
 writer = cv2.VideoWriter(OUTPUT_PATH, cv2.VideoWriter_fourcc(*"mp4v"), fps, (canvas_w, h))
 
 # --- Live display ---
 disp_w, disp_h = int(canvas_w * 0.35), int(h * 0.35)
-ffplay_proc = subprocess.Popen(
-    ["ffplay", "-f", "rawvideo", "-pixel_format", "bgr24",
-     "-video_size", f"{disp_w}x{disp_h}", "-framerate", str(fps),
-     "-window_title", "SAM2 Sharks", "-"],
-    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
-)
-display_alive = True
+ffplay_proc = None
+display_alive = False
+if SHOW_VIDEO:
+    ffplay_proc = subprocess.Popen(
+        ["ffplay", "-f", "rawvideo", "-pixel_format", "bgr24",
+         "-video_size", f"{disp_w}x{disp_h}", "-framerate", str(fps),
+         "-window_title", "SAM2 Sharks", "-"],
+        stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    display_alive = True
 
 thread_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
@@ -517,8 +530,10 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
             frame = cv2.imread(os.path.join(FRAMES_DIR, f"{gi:06d}.jpg"))
             canvas = np.zeros((h, canvas_w, 3), dtype=np.uint8)
             canvas[:, :w] = frame
-            
-            canvas[:, w:] = draw_graph(angle_buffers, track_colors, fps, h)
+            if PLOT_MARGIN:
+                graph_buffers = {best_track_tid: angle_buffers[best_track_tid]}
+                graph_colors = {best_track_tid: track_colors[best_track_tid]}
+                canvas[:, w:] = draw_graph(graph_buffers, graph_colors, fps, h)
             writer.write(canvas)
             send_to_display(canvas)
         continue
@@ -642,8 +657,10 @@ for chunk_start in range(0, total_frames, CHUNK_SIZE):
         canvas = np.zeros((h, canvas_w, 3), dtype=np.uint8)
         canvas[:, :w] = frame
 
-        
-        canvas[:, w:] = draw_graph(angle_buffers, track_colors, fps, h)
+        if PLOT_MARGIN:
+            graph_buffers = {best_track_tid: angle_buffers[best_track_tid]}
+            graph_colors = {best_track_tid: track_colors[best_track_tid]}
+            canvas[:, w:] = draw_graph(graph_buffers, graph_colors, fps, h)
 
         writer.write(canvas)
         send_to_display(canvas)
@@ -657,7 +674,7 @@ writer.release()
 thread_pool.shutdown()
 for f in csv_files.values():
     f.close()
-if display_alive:
+if display_alive and ffplay_proc is not None:
     ffplay_proc.stdin.close()
     ffplay_proc.wait()
 shutil.rmtree(CHUNK_FRAMES_DIR, ignore_errors=True)

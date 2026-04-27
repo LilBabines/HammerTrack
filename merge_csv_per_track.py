@@ -19,8 +19,8 @@ from pathlib import Path
 FPS = 30.0
 
 TRACK_JSON_DIR = "projects/hammer/exports/2021_114/postp_tracks"
-ANGLE_IMAGE_CSV = "projects/hammer/exports/2021_114/okok_angle_image.csv"
-ANGLE_ABSOLUTE_CSV = "projects/hammer/exports/2021_114/okok_angle_absolute.csv"
+ANGLE_IMAGE_CSV = "projects/hammer/exports/2021_114/angle_image.csv"
+ANGLE_ABSOLUTE_CSV = "projects/hammer/exports/2021_114/angle_absolute.csv"
 COHESION_CSV = "projects/hammer/exports/2021_114/cohesion_results.csv"
 OUTPUT_DIR = "projects/hammer/exports/2021_114/per_track_csv"
 
