@@ -29,7 +29,7 @@ git clone https://github.com/LilBabines/HammerTrack.git
 cd HammerTrack
 
 # (Recommended) create a dedicated environment, then:
-pip install torch torchvision  # Adapt for GPU support !!!
+pip install torch torchvision  # Adapt for GPU support : https://pytorch.org/get-started/locally/ !!!
 pip install ultralytics pyside6 boxmot
 ```
 
@@ -80,6 +80,12 @@ behavioural and group-level metrics from the trajectories. They are meant to be
 run **after** tracking, on the files stored in `projects/<project_name>/export/`.
 
 - **`keypoints_TBF.py`** — *Skeletal keypoints + Tail Beat Frequency*.
+
+  > **Required** — install additional packages and download SAM2 weights:
+  > ```bash
+  > pip install sam2 scikit-image
+  > wget https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt
+  > ```
 
   Re-segments each tracked individual frame by frame with **SAM2**, prompted
   by the bounding boxes/centroids stored in the post-processed tracks. From
