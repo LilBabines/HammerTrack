@@ -187,6 +187,16 @@ run **after** tracking, on the files stored in `projects/<project_name>/export/`
   ```
 
 
+## 👥 Authors & Affiliations
+
+HammerTrack is a joint effort between the **[University of Montpellier](https://www.umontpellier.fr/)** (France) and the **[University of Western Australia](https://www.uwa.edu.au/)** (Perth, Australia). The project brings together complementary expertise in computer vision, marine ecology, data acquisition  and shark conservation, and supports collaborative research on non-invasive monitoring of scalloped hammerhead populations using aerial drones.
+
+<p align="center">
+  <img src="assets/logos/logo_um.png" alt="Université de Montpellier" height="90" />
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="assets/logos/logo_uwa.svg" alt="The University of Western Australia" height="90" />
+</p>
+
 ## 📚 Citation
 
 This work is presented at **Sharks International 2026**, as part of research on non-invasive monitoring of hammerhead shark populations.
