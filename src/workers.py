@@ -1,7 +1,7 @@
 import os
 import sys
 import io
-from typing import Dict, List, Optional
+from typing import List, Optional
 import time
 
 import numpy as np
@@ -18,6 +18,36 @@ from .utils import OBBOX, rect_to_poly_xyxy
 
 
 YOLO_MODEL_PATH = ""
+
+# ---------------------------------------------------------------------------
+# Default fallback weights — ultralytics auto-downloads these on first use.
+# Used by `resolve_model_path` when the configured path is empty or missing.
+# ---------------------------------------------------------------------------
+DEFAULT_MODEL_DETECT = "yolo26m.pt"
+DEFAULT_MODEL_OBB    = "yolo26m-obb.pt"
+
+
+def resolve_model_path(model_path: str, task: str = "detect") -> str:
+    """Return ``model_path`` if it points to an existing file on disk,
+    otherwise a sensible default that ultralytics will auto-download.
+
+    Args:
+        model_path: User-configured path (may be empty or missing).
+        task:       Either ``"obb"`` or ``"detect"`` (anything else is treated
+                    as ``"detect"``).
+
+    Defaults:
+        task == "obb"  → ``DEFAULT_MODEL_OBB``  (currently ``yolo26m-obb.pt``)
+        otherwise      → ``DEFAULT_MODEL_DETECT`` (currently ``yolo26m.pt``)
+    """
+    if model_path and os.path.isfile(model_path):
+        return model_path
+    fallback = DEFAULT_MODEL_OBB if task == "obb" else DEFAULT_MODEL_DETECT
+    print(
+        f"[resolve_model_path] '{model_path}' not found — "
+        f"falling back to '{fallback}' (task={task})"
+    )
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -80,25 +110,20 @@ class DetectionWorker(QtCore.QObject):
         self.imgsz = imgsz
         self.source_path = source_path
 
-    @classmethod    
+    @classmethod
     def _get_model(cls, model_path: str):
+        """Return a cached YOLO model, loading it only when the path changes."""
         if not hasattr(cls, "_model") or cls._model_path != model_path:
             print(f"[DetectionWorker] Loading model: {model_path}")
             cls._model = YOLO(model_path)
             cls._model_path = model_path
             cls._model_task = getattr(cls._model, "task", "detect")
             print(f"[DetectionWorker] Model task: {cls._model_task}")
-
-        else: 
-            cls._model = YOLO("")
-
         return cls._model
-
 
     @QtCore.Slot()
     def run(self):
         try:
-
             model = self._get_model(self.model_path)
 
             # --- Choose source: file path preferred, numpy fallback ---
@@ -107,7 +132,7 @@ class DetectionWorker(QtCore.QObject):
             elif self.frame_bgr is not None:
                 # YOLO expects RGB uint8 when given a numpy array
                 bgr = self.frame_bgr
-                # Safety: ensure uint8 (don't use ensure_bgr_u8, just basic conversion)
+                # Safety: ensure uint8 (basic conversion only)
                 if bgr.dtype != np.uint8:
                     if bgr.dtype == np.uint16:
                         bgr = (bgr / 256).astype(np.uint8)
@@ -130,7 +155,11 @@ class DetectionWorker(QtCore.QObject):
             names = getattr(model, "names", None)
 
             # --- Debug ---
-            has_obb = hasattr(res, "obb") and res.obb is not None and len(res.obb) > 0
+            has_obb = (
+                hasattr(res, "obb")
+                and res.obb is not None
+                and len(res.obb) > 0
+            )
             has_boxes = res.boxes is not None and len(res.boxes) > 0
 
             boxes: List[OBBOX] = []
@@ -143,10 +172,13 @@ class DetectionWorker(QtCore.QObject):
                 conf_vals = getattr(obb, "conf", None)
 
                 if polys is not None and len(polys) > 0:
-                    P = polys.cpu().numpy() if hasattr(polys, "cpu") else np.asarray(polys)
-                    C = cls.cpu().numpy() if hasattr(cls, "cpu") else np.zeros(len(P))
-                    S = conf_vals.cpu().numpy() if hasattr(conf_vals, "cpu") else np.ones(len(P))
-                    for i, (p, c, s) in enumerate(zip(P, C, S)):
+                    P = (polys.cpu().numpy() if hasattr(polys, "cpu")
+                         else np.asarray(polys))
+                    C = (cls.cpu().numpy() if hasattr(cls, "cpu")
+                         else np.zeros(len(P)))
+                    S = (conf_vals.cpu().numpy() if hasattr(conf_vals, "cpu")
+                         else np.ones(len(P)))
+                    for p, c, s in zip(P, C, S):
                         boxes.append(OBBOX(
                             poly=p.reshape(4, 2).astype(np.float32),
                             cls_id=int(c), conf=float(s),
@@ -154,16 +186,29 @@ class DetectionWorker(QtCore.QObject):
                 else:
                     xywhr = getattr(obb, "xywhr", None)
                     if xywhr is not None and len(xywhr) > 0:
-                        X = xywhr.cpu().numpy() if hasattr(xywhr, "cpu") else np.asarray(xywhr)
-                        C = cls.cpu().numpy() if hasattr(cls, "cpu") else np.zeros(len(X))
-                        S = conf_vals.cpu().numpy() if hasattr(conf_vals, "cpu") else np.ones(len(X))
+                        X = (xywhr.cpu().numpy() if hasattr(xywhr, "cpu")
+                             else np.asarray(xywhr))
+                        C = (cls.cpu().numpy() if hasattr(cls, "cpu")
+                             else np.zeros(len(X)))
+                        S = (conf_vals.cpu().numpy()
+                             if hasattr(conf_vals, "cpu") else np.ones(len(X)))
                         for (cx, cy, w, h, rad), c, s in zip(X, C, S):
-                            rect = np.array([[-w/2, -h/2], [w/2, -h/2],
-                                             [w/2, h/2], [-w/2, h/2]], dtype=np.float32)
+                            rect = np.array(
+                                [[-w / 2, -h / 2], [w / 2, -h / 2],
+                                 [w / 2, h / 2], [-w / 2, h / 2]],
+                                dtype=np.float32,
+                            )
                             cos_r, sin_r = np.cos(rad), np.sin(rad)
-                            R = np.array([[cos_r, -sin_r], [sin_r, cos_r]], dtype=np.float32)
-                            pts = rect @ R.T + np.array([cx, cy], dtype=np.float32)
-                            boxes.append(OBBOX(poly=pts, cls_id=int(c), conf=float(s)))
+                            R = np.array(
+                                [[cos_r, -sin_r], [sin_r, cos_r]],
+                                dtype=np.float32,
+                            )
+                            pts = rect @ R.T + np.array(
+                                [cx, cy], dtype=np.float32
+                            )
+                            boxes.append(OBBOX(
+                                poly=pts, cls_id=int(c), conf=float(s),
+                            ))
 
             # --- AABB fallback ---
             elif has_boxes:
@@ -175,7 +220,6 @@ class DetectionWorker(QtCore.QObject):
                         poly=rect_to_poly_xyxy(x1, y1, x2, y2),
                         cls_id=int(c), conf=float(s),
                     ))
-                
 
             print(f"[DetectionWorker] Emitting {len(boxes)} boxes")
             self.finished.emit(self.frame_idx, names, boxes)
@@ -194,14 +238,14 @@ class DetectFinetuneWorker(QtCore.QObject):
     """Build a YOLO-OBB dataset from verified polygons and fine-tune the model.
 
     Signals:
-        progress(str, float)   — message + progress in [0, 1]
-        epoch_metrics(int, int, dict) — current_epoch, total_epochs, metrics dict
-        log_line(str)          — a line of console output
-        finished(str)          — path to best.pt
+        progress(str, float)          — message + progress in [0, 1]
+        epoch_metrics(int, int, dict) — current_epoch, total_epochs, metrics
+        log_line(str)                 — a line of console output
+        finished(str)                 — path to best.pt
         error(str)
     """
     progress = QtCore.Signal(str, float)
-    epoch_metrics = QtCore.Signal(int, int, object)   # epoch, total, {metric: value}
+    epoch_metrics = QtCore.Signal(int, int, object)
     log_line = QtCore.Signal(str)
     finished = QtCore.Signal(str)
     error = QtCore.Signal(str)
@@ -239,11 +283,17 @@ class DetectFinetuneWorker(QtCore.QObject):
 
         try:
             if YOLO is None:
-                raise RuntimeError("Ultralytics is not installed. `pip install ultralytics`")
+                raise RuntimeError(
+                    "Ultralytics is not installed. `pip install ultralytics`"
+                )
             if not os.path.isfile(self.base_model_path):
-                raise FileNotFoundError(f"Base model not found: {self.base_model_path}")
+                raise FileNotFoundError(
+                    f"Base model not found: {self.base_model_path}"
+                )
             if not self.class_names:
-                raise ValueError("class_names is empty; cannot write dataset.yaml.")
+                raise ValueError(
+                    "class_names is empty; cannot write dataset.yaml."
+                )
 
             ts = time.strftime("%Y%m%d-%H%M%S")
             run_dir = os.path.join(self.out_root, f"run-{ts}")
@@ -252,7 +302,7 @@ class DetectFinetuneWorker(QtCore.QObject):
 
             # --- Register ultralytics callbacks for per-epoch progress ---
             total_epochs = self.epochs
-            worker_ref = self   # prevent garbage-collection issues in closure
+            worker_ref = self  # prevent GC issues in closure
 
             def _on_fit_epoch_end(trainer):
                 """Called by ultralytics at the end of each epoch (after val)."""
@@ -268,7 +318,8 @@ class DetectFinetuneWorker(QtCore.QObject):
                             pass
 
                 # Also grab the last training loss values
-                if hasattr(trainer, "loss_items") and trainer.loss_items is not None:
+                if (hasattr(trainer, "loss_items")
+                        and trainer.loss_items is not None):
                     loss_names = getattr(trainer, "loss_names", None)
                     loss_vals = trainer.loss_items
                     if hasattr(loss_vals, "cpu"):
@@ -278,14 +329,18 @@ class DetectFinetuneWorker(QtCore.QObject):
                             metrics[f"train/{name}"] = float(val)
 
                 frac = epoch / total_epochs
-                worker_ref.progress.emit(f"Epoch {epoch}/{total_epochs}", frac)
+                worker_ref.progress.emit(
+                    f"Epoch {epoch}/{total_epochs}", frac
+                )
                 worker_ref.epoch_metrics.emit(epoch, total_epochs, metrics)
 
             model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
 
             self.progress.emit("Starting training...", 0.0)
-            self.log_line.emit(f"=== Training started: {total_epochs} epochs, "
-                               f"imgsz={self.imgsz}, batch={self.batch} ===")
+            self.log_line.emit(
+                f"=== Training started: {total_epochs} epochs, "
+                f"imgsz={self.imgsz}, batch={self.batch} ==="
+            )
 
             model.train(
                 data=self.data_yaml,
@@ -308,10 +363,14 @@ class DetectFinetuneWorker(QtCore.QObject):
                 if os.path.isfile(last_pt):
                     best_pt = last_pt
                 else:
-                    raise RuntimeError("Training finished but no weights found.")
+                    raise RuntimeError(
+                        "Training finished but no weights found."
+                    )
 
             self.progress.emit("Training complete!", 1.0)
-            self.log_line.emit(f"=== Training complete — weights: {best_pt} ===")
+            self.log_line.emit(
+                f"=== Training complete — weights: {best_pt} ==="
+            )
             self.finished.emit(best_pt)
 
         except Exception as e:

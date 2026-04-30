@@ -20,11 +20,11 @@ import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .utils import (
+from ..utils import (
     OBBOX, FrameSource, VideoSource, ImageFolderSource,
     cvimg_to_qimage, ensure_bgr_u8,
 )
-from .workers import YOLO_MODEL_PATH
+from ..workers import YOLO_MODEL_PATH
 
 try:
     from ultralytics import YOLO
@@ -48,12 +48,12 @@ def build_tracker(cfg: dict):
     if not BOXMOT_AVAILABLE:
         raise RuntimeError("boxmot is not installed. pip install boxmot")
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    reid_weights = Path(cfg.get("reid_weights", "osnet_x0_25_msmt17.pt"))
+    # reid_weights = Path(cfg.get("reid_weights", "osnet_x0_25_msmt17.pt"))
     return BotSort(
-        reid_weights=reid_weights,
+        reid_weights="",
         device=device,
         half=False,
-        with_reid=cfg.get("with_reid", True),
+        with_reid=False,
         track_high_thresh=float(cfg.get("track_high_thresh", 0.6)),
         track_low_thresh=float(cfg.get("track_low_thresh", 0.1)),
         new_track_thresh=float(cfg.get("new_track_thresh", 0.7)),
@@ -313,7 +313,7 @@ class TrackingStepWorker(QtCore.QObject):
                         pts = rect @ R.T + np.array([cx, cy], dtype=np.float32)
                         boxes.append(OBBOX(poly=pts, cls_id=int(c), conf=float(s)))
         elif res.boxes is not None and len(res.boxes) > 0:
-            from .utils import rect_to_poly_xyxy
+            from ..utils import rect_to_poly_xyxy
             xyxy = res.boxes.xyxy.cpu().numpy()
             C = res.boxes.cls.cpu().numpy()
             S = res.boxes.conf.cpu().numpy()
