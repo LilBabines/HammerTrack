@@ -362,6 +362,22 @@ class LauncherWindow(QtWidgets.QMainWindow):
         if self._current_project:
             return self.pm.load_config(self._current_project)
         return {}
+    
+    def project_dir(self) -> Optional[str]:
+        """Directory of the open project, or None when none is open.
+
+        Pages need this to write beside the project rather than wherever a file
+        dialog last pointed: exports and the individuals mapping are
+        project-scoped, and a mapping saved elsewhere is a mapping lost.
+        """
+        if self._current_project:
+            return self.pm.project_dir(self._current_project)
+        return None
+
+    def _save_current_config(self):
+        if not self._current_project:
+            QtWidgets.QMessageBox.warning(self, "Save", "No project selected.")
+
 
     def _save_current_config(self):
         if not self._current_project:

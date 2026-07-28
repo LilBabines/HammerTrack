@@ -27,7 +27,12 @@ from .tracking_helpers import (
     obb_to_xywhr,
     update_strack_bbox,
 )
+from .individuals import (
+    IndividualStore, individuals_dir, individuals_path,
+)
+from .individuals_panel import IndividualsPanel, ask_rename
 from .tracking_workers import TrackingStepWorker, VideoExportWorker
+from ..tasks import normalize_task
 from ..utils import (
     OBBOX, FrameSource, VideoSource, ImageFolderSource,
     ensure_bgr_u8,
@@ -72,6 +77,23 @@ class TrackingPage(QtWidgets.QWidget):
 
         # Pending ID changes (old_tid → new_tid) for sync with tracker
         self._pending_id_changes: Dict[int, int] = {}
+        # Track IDs whose box the user moved/reshaped since the last step.
+        # Only these get their Kalman state rewritten: touching untouched
+        # tracks on every step is what used to break ID continuity.
+        self._edited_tids: set = set()
+
+        # ==================== Individuals (identity layer) ====================
+        # Grouping of tracker fragments into real animals. Per clip, because
+        # raw track IDs mean nothing across clips.
+        self.individuals = IndividualStore()
+        self._export_dir: Optional[str] = None
+
+        # Derived views of the caches above. Rebuilding them costs a pass over
+        # every tracked frame, which is far too slow to redo on each playback
+        # tick, so they are memoised and invalidated explicitly.
+        self._frames_by_track_cache: Optional[Dict[int, set]] = None
+        self._conflicts_cache: Optional[Dict[int, int]] = None
+        self._panel_state: Optional[tuple] = None
 
         # Run-state flags (block UI while threads work)
         self._tracking_running = False
@@ -159,6 +181,15 @@ class TrackingPage(QtWidgets.QWidget):
         self.trail_len_spin.setRange(5, 9999)
         self.trail_len_spin.setValue(60)
 
+        # ---- Individuals ----
+        self.individuals_panel = IndividualsPanel()
+
+        self.only_assigned_chk = QtWidgets.QCheckBox("Assigned tracks only")
+        self.only_assigned_chk.setToolTip(
+            "Leave unassigned fragments out of per_frame/ and per_track/.\n"
+            "individuals/ never contains them: they belong to no animal."
+        )
+
         # ---- Layout ----
         left = QtWidgets.QWidget()
         lv = QtWidgets.QVBoxLayout(left)
@@ -184,7 +215,8 @@ class TrackingPage(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(panel)
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(8)
-        v.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        # No AlignTop here any more: the individuals area carries the stretch,
+        # so it grows with the window instead of a trailing spacer doing it.
 
         src = QtWidgets.QGroupBox("Source")
         sl = QtWidgets.QVBoxLayout(src)
@@ -210,15 +242,31 @@ class TrackingPage(QtWidgets.QWidget):
         el.addWidget(self.id_spin)
         el.addWidget(self.delete_btn)
 
+        # A long session can hold dozens of individuals, so the panel scrolls
+        # instead of pushing Export off the bottom of the window.
+        ind_scroll = QtWidgets.QScrollArea()
+        ind_scroll.setWidget(self.individuals_panel)
+        ind_scroll.setWidgetResizable(True)
+        ind_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        ind_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        ind_scroll.setMinimumHeight(220)
+
         exp = QtWidgets.QGroupBox("Export")
         xl = QtWidgets.QVBoxLayout(exp)
+        xl.addWidget(self.only_assigned_chk)
         xl.addWidget(self.export_btn)
         xl.addWidget(self.export_data_btn)
 
-        for grp in (src, trk, vis, edit, exp):
+        for grp in (src, trk, vis, edit):
             v.addWidget(grp)
-        v.addStretch(1)
+        v.addWidget(ind_scroll, stretch=1)
+        v.addWidget(exp)
 
+        # The scroll area reports a small width hint, and horizontal scrolling
+        # is off, so the floor has to be set here or the chips get clipped.
+        panel.setMinimumWidth(250)
         panel.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Fixed,
             QtWidgets.QSizePolicy.Policy.Expanding,
@@ -259,6 +307,14 @@ class TrackingPage(QtWidgets.QWidget):
         self.trail_len_spin.valueChanged.connect(self._on_visu_changed)
         self.id_spin.valueChanged.connect(self._on_id_spin_changed)
 
+        ip = self.individuals_panel
+        ip.track_selected.connect(self._select_track_id)
+        ip.create_requested.connect(self._individual_create)
+        ip.assign_requested.connect(self._individual_assign)
+        ip.unassign_requested.connect(self._individual_unassign)
+        ip.rename_requested.connect(self._individual_rename)
+        ip.delete_requested.connect(self._individual_delete)
+
     # ==================== Launcher hook ====================
 
     def set_launcher(self, launcher):
@@ -268,8 +324,218 @@ class TrackingPage(QtWidgets.QWidget):
         if self._launcher:
             self._launcher.statusBar().showMessage(msg, 5000)
 
+    def _task(self) -> str:
+        """Project task; decides the tracker's detection layout."""
+        return normalize_task(self._cfg().get("task_type"))
+
     def _cfg(self) -> dict:
         return self._launcher.project_config() if self._launcher else {}
+
+    # ==================== Individuals — paths & persistence ====================
+
+    def _clip_export_dir(self) -> Optional[str]:
+        """``<project>/exports/<clip>/`` for the loaded clip.
+
+        The clip folder is the source's stem, so re-opening the same video
+        finds its own mapping again. Returns None when there is no project or
+        no source, in which case nothing is persisted rather than being written
+        to an arbitrary place.
+        """
+        if self.source is None or self._launcher is None:
+            return None
+        project_dir = getattr(self._launcher, "project_dir", lambda: None)()
+        if not project_dir:
+            return None
+        clip = Path(getattr(self.source, "path", "") or self.source.name()).stem
+        if not clip:
+            return None
+        return str(Path(project_dir) / "exports" / clip)
+
+    def _save_individuals(self):
+        """Persist after every mutation: grouping is slow, redoing it is worse."""
+        if not self._export_dir:
+            return
+        try:
+            self.individuals.save(individuals_path(self._export_dir))
+        except OSError as exc:
+            self._status(f"Could not save individuals: {exc}")
+
+    def _load_individuals(self):
+        """Load this clip's mapping, reporting IDs that no longer exist."""
+        self.individuals.clear()
+        self._invalidate_grouping_views()
+        if not self._export_dir:
+            self._status(
+                "No project open: individuals will not be saved to disk."
+            )
+            return
+        path = individuals_path(self._export_dir)
+        if not self.individuals.load(path):
+            return
+        stale = self.individuals.stale_track_ids(self._all_cached_track_ids())
+        msg = f"Loaded {len(self.individuals)} individual(s)."
+        if stale:
+            # Not dropped: the tracks reappear as soon as the clip is re-tracked
+            # with the same settings, and silently discarding the grouping would
+            # be worse than carrying a stale entry.
+            msg += (f" {len(stale)} assigned track(s) not in the current cache"
+                    " — re-run the tracker to see them.")
+        self._status(msg)
+
+    # ==================== Individuals — derived views ====================
+
+    def _all_cached_track_ids(self) -> List[int]:
+        return sorted(self._frames_by_track().keys())
+
+    def _invalidate_track_views(self):
+        """Call when ``track_cache`` changed (new frames, IDs, deletions)."""
+        self._frames_by_track_cache = None
+        self._conflicts_cache = None
+        self._panel_state = None
+
+    def _invalidate_grouping_views(self):
+        """Call when the grouping changed but the detections did not."""
+        self._conflicts_cache = None
+        self._panel_state = None
+
+    def _frames_by_track(self) -> Dict[int, set]:
+        """``{track_id: {frames}}`` over the whole cache, memoised."""
+        if self._frames_by_track_cache is None:
+            fbt: Dict[int, set] = defaultdict(set)
+            for frame_idx, annots in self.track_cache.items():
+                for b in annots:
+                    if not b.deleted and b.track_id >= 0:
+                        fbt[int(b.track_id)].add(int(frame_idx))
+            self._frames_by_track_cache = dict(fbt)
+        return self._frames_by_track_cache
+
+    def _conflicts(self) -> Dict[int, int]:
+        """``{uid: n_frames}`` where two tracks of one animal overlap."""
+        if self._conflicts_cache is None:
+            self._conflicts_cache = self.individuals.frame_conflicts(
+                self._frames_by_track()
+            )
+        return self._conflicts_cache
+
+    def _frame_track_ids(self) -> List[int]:
+        """Track IDs visible on the current frame."""
+        annots = self.track_cache.get(self.current_idx, [])
+        return sorted({int(b.track_id) for b in annots
+                       if not b.deleted and b.track_id >= 0})
+
+    def _individual_label(self, track_id: int) -> Optional[str]:
+        ind = self.individuals.individual_of(track_id)
+        return ind.name if ind else None
+
+    # ==================== Individuals — selection bridge ====================
+
+    def _selected_track_id(self) -> Optional[int]:
+        """Track ID of the selected annotation, or None."""
+        annots = self.track_cache.get(self.current_idx, [])
+        if self.selected_idx is None or not (
+            0 <= self.selected_idx < len(annots)
+        ):
+            return None
+        tid = int(annots[self.selected_idx].track_id)
+        return tid if tid >= 0 else None
+
+    def _select_track_id(self, track_id: int):
+        """Select the annotation carrying ``track_id`` on the current frame."""
+        annots = self.track_cache.get(self.current_idx, [])
+        for i, b in enumerate(annots):
+            if not b.deleted and int(b.track_id) == int(track_id):
+                self.selected_idx = i
+                self._update_id_spin()
+                self._redraw()
+                self._refresh_individuals()
+                return
+
+    def _refresh_individuals(self, force: bool = False):
+        """Redraw the panel, skipping the rebuild when nothing visible moved.
+
+        ``_read_frame`` runs on every playback tick, and rebuilding a few dozen
+        buttons at 25 fps is wasted work; the state key makes that a no-op.
+        """
+        tids = self._frame_track_ids()
+        selected = self._selected_track_id()
+        conflicts = self._conflicts()
+        state = (
+            tuple(tids), selected,
+            tuple(sorted(conflicts.items())),
+            tuple((i.uid, i.name, tuple(i.track_ids), i.notes)
+                  for i in self.individuals.all()),
+        )
+        if not force and state == self._panel_state:
+            return
+        self._panel_state = state
+        self.individuals_panel.refresh(
+            self.individuals, tids, selected, conflicts
+        )
+
+    # ==================== Individuals — actions ====================
+
+    def _individual_create(self):
+        tid = self._selected_track_id()
+        if tid is None:
+            return
+        ind = self.individuals.create([tid])
+        self._after_grouping_change(f"Track {tid} → new individual {ind.name}.")
+
+    def _individual_assign(self, uid: int):
+        tid = self._selected_track_id()
+        if tid is None:
+            return
+        if not self.individuals.assign(tid, int(uid)):
+            return
+        ind = self.individuals.get(int(uid))
+        name = ind.name if ind else uid
+        self._after_grouping_change(f"Track {tid} → {name}.")
+
+    def _individual_unassign(self):
+        tid = self._selected_track_id()
+        if tid is None or not self.individuals.unassign(tid):
+            return
+        self._after_grouping_change(f"Track {tid} detached.")
+
+    def _individual_rename(self, uid: int):
+        ind = self.individuals.get(int(uid))
+        if ind is None:
+            return
+        result = ask_rename(self, ind)
+        if result is None:
+            return
+        name, notes = result
+        if name.strip():
+            self.individuals.rename(int(uid), name)
+        self.individuals.set_notes(int(uid), notes)
+        self._after_grouping_change(f"Renamed to {ind.name}.")
+
+    def _individual_delete(self, uid: int):
+        ind = self.individuals.get(int(uid))
+        if ind is None:
+            return
+        if ind.track_ids:
+            reply = QtWidgets.QMessageBox.question(
+                self, "Delete individual",
+                f"Delete '{ind.name}'?\n\n"
+                f"Its {len(ind.track_ids)} track(s) become unassigned; "
+                "no detection is lost.",
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        name = ind.name
+        self.individuals.delete(int(uid))
+        self._after_grouping_change(f"Deleted {name}.")
+
+    def _after_grouping_change(self, message: str):
+        """Shared tail of every grouping action: persist, recolour, report."""
+        self._invalidate_grouping_views()
+        self._save_individuals()
+        self._redraw()
+        self._refresh_individuals(force=True)
+        self._status(message)
 
     # ==================== Source loading ====================
 
@@ -302,7 +568,11 @@ class TrackingPage(QtWidgets.QWidget):
         self._pending_id_changes.clear()
         self.frame_slider.setRange(0, max(0, self.total_frames - 1))
         self.frame_slider.setValue(0)
-        self._reset_tracker()
+        # Nothing is tracked yet, so there is no mapping to protect: reset
+        # without the stale-mapping prompt, then load the clip's own file.
+        self._reset_tracker(confirm=False, quiet=True)
+        self._export_dir = self._clip_export_dir()
+        self._load_individuals()
         self._read_frame(0)
         self._status(f"Loaded: {src.name()} | {self.total_frames} frames")
 
@@ -325,6 +595,7 @@ class TrackingPage(QtWidgets.QWidget):
         self._update_export_btns()
         self._update_id_spin()
         self._redraw()
+        self._refresh_individuals()
         if self._launcher:
             self._launcher.update_title()
 
@@ -338,6 +609,10 @@ class TrackingPage(QtWidgets.QWidget):
             trajectories,
             trail_length=self.trail_len_spin.value(),
             show_trails=self.show_trails_chk.isChecked(),
+            # Every fragment of one animal shares its colour; unassigned ones
+            # fall back to their per-track hue and so stay distinguishable.
+            color_of=self.individuals.color_for_track,
+            label_of=self._individual_label,
         )
         self.canvas.set_frame(annotated)
 
@@ -414,6 +689,11 @@ class TrackingPage(QtWidgets.QWidget):
 
         annots = self.track_cache.get(self.last_tracked_idx, [])
 
+        deleted_tids = {b.track_id for b in annots
+                        if b.deleted and b.track_id >= 0}
+        if not (self._pending_id_changes or deleted_tids or self._edited_tids):
+            return   # nothing was edited: leave the tracker alone
+
         # 1. Apply pending ID changes
         if self._pending_id_changes:
             for attr in ("active_tracks", "lost_stracks"):
@@ -430,8 +710,6 @@ class TrackingPage(QtWidgets.QWidget):
             self._pending_id_changes.clear()
 
         # 2. Remove deleted tracks
-        deleted_tids = {b.track_id for b in annots
-                        if b.deleted and b.track_id >= 0}
         if deleted_tids:
             for attr in ("active_tracks", "lost_stracks"):
                 pool = getattr(self.tracker, attr, None)
@@ -445,7 +723,8 @@ class TrackingPage(QtWidgets.QWidget):
         # 3. Update positions for surviving tracks
         active_map: Dict[int, Tuple[float, float, float, float]] = {}
         for b in annots:
-            if not b.deleted and b.track_id >= 0:
+            if (not b.deleted and b.track_id >= 0
+                    and b.track_id in self._edited_tids):
                 pts = b.poly.reshape(-1, 2)
                 x1, y1 = float(pts[:, 0].min()), float(pts[:, 1].min())
                 x2, y2 = float(pts[:, 0].max()), float(pts[:, 1].max())
@@ -463,6 +742,8 @@ class TrackingPage(QtWidgets.QWidget):
                             update_strack_bbox(st, *active_map[tid])
                         except Exception:
                             pass
+
+        self._edited_tids.clear()
 
     # ==================== Tracker — step ====================
 
@@ -506,6 +787,7 @@ class TrackingPage(QtWidgets.QWidget):
         self.traj_snapshots.clear()
         self.cmc_cache.clear()
         self._pending_id_changes.clear()
+        self._edited_tids.clear()
 
         self.selected_idx = None
         self.mode = "select"
@@ -519,15 +801,66 @@ class TrackingPage(QtWidgets.QWidget):
         self.frame_slider.setValue(0)
         self.frame_slider.blockSignals(False)
 
+        self.individuals.clear()
+        self._export_dir = None
+        self._invalidate_track_views()
+
         self.canvas.set_frame(None)
         self._update_step_btn()
         self._update_export_btns()
+        self._refresh_individuals(force=True)
 
     def is_busy(self) -> bool:
         """True while a tracking step or a video export is still running."""
         return bool(self._tracking_running or self._exporting)
 
-    def _reset_tracker(self):
+    def _reset_tracker(self, *, confirm: bool = True, quiet: bool = False):
+        """Drop the tracker and every cache tied to its raw IDs.
+
+        ``confirm`` is keyword-only on purpose: ``clicked`` would otherwise
+        hand its ``checked`` boolean straight into it and silently skip the
+        prompt.
+        """
+        n_assigned = sum(len(i.track_ids) for i in self.individuals.all())
+
+        if confirm and n_assigned:
+            # A reset makes BoxMOT reallocate IDs from 1, so track 7 after the
+            # reset is a different animal than track 7 before it. Keeping the
+            # mapping is legitimate (re-tracking with identical settings
+            # reproduces the IDs), so the choice is the user's.
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("Reset tracker")
+            box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+            box.setText(
+                f"{len(self.individuals)} individual(s) reference "
+                f"{n_assigned} track(s)."
+            )
+            box.setInformativeText(
+                "Resetting reallocates raw track IDs, so the current grouping "
+                "may end up pointing at the wrong animals.\n\n"
+                "Clear it, or keep it and re-track with the same settings?"
+            )
+            clear_btn = box.addButton(
+                "Reset and clear grouping",
+                QtWidgets.QMessageBox.ButtonRole.DestructiveRole,
+            )
+            keep_btn = box.addButton(
+                "Reset and keep grouping",
+                QtWidgets.QMessageBox.ButtonRole.AcceptRole,
+            )
+            cancel_btn = box.addButton(
+                QtWidgets.QMessageBox.StandardButton.Cancel
+            )
+            box.setDefaultButton(keep_btn)
+            box.exec()
+
+            clicked = box.clickedButton()
+            if clicked is cancel_btn:
+                return
+            if clicked is clear_btn:
+                self.individuals.clear()
+                self._save_individuals()
+
         self.tracker = None
         self.last_tracked_idx = -1
         self.track_cache.clear()
@@ -535,10 +868,14 @@ class TrackingPage(QtWidgets.QWidget):
         self.cmc_cache.clear()
         self.selected_idx = None
         self._pending_id_changes.clear()
+        self._edited_tids.clear()
+        self._invalidate_track_views()
         self._update_step_btn()
         self._update_export_btns()
         self._redraw()
-        self._status("Tracker reset.")
+        self._refresh_individuals(force=True)
+        if not quiet:
+            self._status("Tracker reset.")
 
     def _set_ui_locked(self, locked: bool):
         self._tracking_running = locked
@@ -553,6 +890,7 @@ class TrackingPage(QtWidgets.QWidget):
         ):
             w.setEnabled(enabled)
         self.id_spin.setEnabled(enabled and self.selected_idx is not None)
+        self.individuals_panel.setEnabled(enabled)
         ok = enabled and bool(self.track_cache)
         self.export_btn.setEnabled(ok)
         self.export_data_btn.setEnabled(ok)
@@ -563,7 +901,7 @@ class TrackingPage(QtWidgets.QWidget):
         if self._tracking_running:
             return
         if self.tracker is None:
-            self.tracker = build_tracker(self._cfg())
+            self.tracker = build_tracker(self._cfg(), self._task())
             self.last_tracked_idx = -1
             self._status("Tracker initialised (BoTSORT AABB).")
 
@@ -588,6 +926,7 @@ class TrackingPage(QtWidgets.QWidget):
             conf=float(self.conf_spin.value()),
             imgsz=int(cfg.get("imgsz", 1024)),
             frame_skip=self.frame_skip_spin.value(),
+            task=self._task(),
         )
         self._wk.moveToThread(self._wt)
         self._wt.started.connect(self._wk.run)
@@ -606,6 +945,7 @@ class TrackingPage(QtWidgets.QWidget):
     def _on_frame_tracked(self, idx: int, obbs):
         self.track_cache[idx] = list(obbs)
         self.last_tracked_idx = max(self.last_tracked_idx, idx)
+        self._invalidate_track_views()
         if idx == self.current_idx:
             self._redraw()
 
@@ -632,6 +972,7 @@ class TrackingPage(QtWidgets.QWidget):
         self._update_export_btns()
         self.progress_bar.setFormat("Done")
         self._redraw()
+        self._refresh_individuals(force=True)
         last_snap = self.traj_snapshots.get(self.last_tracked_idx, {})
         self._status(
             f"Tracked to frame {self.last_tracked_idx}. "
@@ -728,8 +1069,13 @@ class TrackingPage(QtWidgets.QWidget):
         if self._tracking_running or self._exporting:
             return
 
+        # Pre-fill with the clip's own export folder so the default answer is
+        # the one the mapping and the post-processing script both expect.
+        if self._export_dir:
+            Path(self._export_dir).mkdir(parents=True, exist_ok=True)
         out_dir = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Select output folder for tracking data"
+            self, "Select output folder for tracking data",
+            self._export_dir or "",
         )
         if not out_dir:
             return
@@ -761,9 +1107,21 @@ class TrackingPage(QtWidgets.QWidget):
             "confidence class_id\n"
         )
 
+        only_assigned = self.only_assigned_chk.isChecked()
+        n_skipped_tracks = 0
+        if only_assigned:
+            n_skipped_tracks = len(self.individuals.unassigned(
+                self._all_cached_track_ids()
+            ))
+
         for frame_idx in sorted(self.track_cache.keys()):
             annots = self.track_cache[frame_idx]
             active = [b for b in annots if not b.deleted and b.track_id >= 0]
+            if only_assigned:
+                active = [
+                    b for b in active
+                    if self.individuals.individual_of(b.track_id) is not None
+                ]
             if not active:
                 continue
 
@@ -831,19 +1189,58 @@ class TrackingPage(QtWidgets.QWidget):
                 json.dumps(record, indent=2, ensure_ascii=False)
             )
 
+        # ── Individuals: one merged file per animal ──
+        # Same collision rule as track_postprocess.merge_tracks (highest
+        # confidence wins). No interpolation or smoothing here: those stay in
+        # the script, to be run over these files as an opt-in pass.
+        written: List[dict] = []
+        n_dropped = 0
+        if len(self.individuals):
+            written = self.individuals.export_individuals(
+                individuals_dir(out_dir), per_track
+            )
+            n_dropped = sum(w["dropped"] for w in written)
+            # Keep the identity next to the data it describes, and leave a
+            # pasteable groups list for the script's hardcoded `groups`.
+            self.individuals.save(individuals_path(out_dir))
+            # ...and refresh the canonical per-clip copy, which is a different
+            # file whenever the user exported somewhere else.
+            self._save_individuals()
+            self.individuals.export_groups_json(
+                str(Path(out_dir) / "groups.json")
+            )
+
         n_tracks = len(per_track)
         n_cmc = sum(1 for v in self.cmc_cache.values() if v is not None)
         self._status(
             f"Exported {n_detections} detections across {n_frames} frames, "
-            f"{n_tracks} tracks, {n_cmc} CMC matrices → {out_dir}"
+            f"{n_tracks} tracks, {len(written)} individuals, "
+            f"{n_cmc} CMC matrices → {out_dir}"
         )
-        QtWidgets.QMessageBox.information(
-            self, "Data export complete",
-            f"Exported to: {out_dir}\n\n"
-            f"per_frame/  → {n_frames} files\n"
-            f"per_track/  → {n_tracks} JSON files\n"
-            f"cmc_transforms.json → {n_cmc} matrices\n"
+
+        lines = [
+            f"Exported to: {out_dir}",
+            "",
+            f"per_frame/  → {n_frames} files",
+            f"per_track/  → {n_tracks} JSON files",
+            f"cmc_transforms.json → {n_cmc} matrices",
             f"Total detections: {n_detections}",
+        ]
+        if written:
+            lines += [
+                "",
+                f"individuals/ → {len(written)} merged files",
+                f"  {n_dropped} detection(s) dropped on frame collisions "
+                "(highest confidence kept)",
+                "groups.json  → pasteable into track_postprocess.py",
+            ]
+        elif len(self.individuals):
+            lines += ["", "individuals/ → nothing written: no track grouped."]
+        if n_skipped_tracks:
+            lines += ["", f"{n_skipped_tracks} unassigned track(s) skipped."]
+
+        QtWidgets.QMessageBox.information(
+            self, "Data export complete", "\n".join(lines),
         )
 
     # ==================== Selection / editing ====================
@@ -858,8 +1255,10 @@ class TrackingPage(QtWidgets.QWidget):
             return
         annots[self.selected_idx].deleted = True
         self.selected_idx = None
+        self._invalidate_track_views()
         self._update_id_spin()
         self._redraw()
+        self._refresh_individuals()
 
     def _update_id_spin(self):
         annots = self.track_cache.get(self.current_idx, [])
@@ -886,7 +1285,9 @@ class TrackingPage(QtWidgets.QWidget):
             annots[self.selected_idx].track_id = val
             if old_id >= 0:
                 self._pending_id_changes[old_id] = val
+            self._invalidate_track_views()
         self._redraw()
+        self._refresh_individuals()
 
     def _pick_annot(self, x: float, y: float) -> Optional[int]:
         annots = self.track_cache.get(self.current_idx, [])
@@ -920,11 +1321,23 @@ class TrackingPage(QtWidgets.QWidget):
         annots[self.selected_idx].poly = (
             self.orig_poly + np.array([dx, dy], dtype=np.float32)
         ).astype(np.float32)
+        self._mark_edited(annots[self.selected_idx])
+
+    def _mark_edited(self, box):
+        """Remember that this track's geometry was corrected by hand.
+
+        Only marked tracks get their Kalman state rewritten before the next
+        step, so untouched tracks keep predicting normally.
+        """
+        tid = int(getattr(box, "track_id", -1))
+        if tid >= 0:
+            self._edited_tids.add(tid)
 
     def _set_vertex(self, vi: int, x: float, y: float):
         annots = self.track_cache.get(self.current_idx, [])
         if self.selected_idx is None or self.selected_idx >= len(annots):
             return
+        self._mark_edited(annots[self.selected_idx])
         p = annots[self.selected_idx].poly.copy()
         p[vi] = [x, y]
         annots[self.selected_idx].poly = p.astype(np.float32)
@@ -948,11 +1361,13 @@ class TrackingPage(QtWidgets.QWidget):
             self.selected_idx = None
             self._update_id_spin()
             self._redraw()
+            self._refresh_individuals()
             return
 
         self.selected_idx = hit
         self._update_id_spin()
         self._redraw()
+        self._refresh_individuals()
 
         # Edit-mode: try to pick a vertex first
         if self.mode == "edit":

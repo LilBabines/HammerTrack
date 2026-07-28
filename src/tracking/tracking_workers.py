@@ -19,13 +19,15 @@ from ..utils import (
     OBBOX, FrameSource,
     ensure_bgr_u8, rect_to_poly_xyxy,
 )
+from ..tasks import TASK_OBB, normalize_task
 from ..workers import resolve_model_path
 from .tracking_helpers import (
     draw_tracked_annotations,
     extract_cmc_matrix,
     extract_trajectories_from_tracker,
+    boxes_to_dets,
     iou_matrix,
-    obb_to_aabb_row,
+    parse_track_results,
 )
 
 try:
@@ -47,7 +49,7 @@ class TrackingStepWorker(QtCore.QObject):
     error         = QtCore.Signal(str)
 
     def __init__(self, source, start_idx, end_idx, tracker,
-                 model_path, conf, imgsz, frame_skip=1):
+                 model_path, conf, imgsz, frame_skip=1, task=TASK_OBB):
         super().__init__()
         self.source = source
         self.start_idx = start_idx
@@ -57,6 +59,10 @@ class TrackingStepWorker(QtCore.QObject):
         self.conf = conf
         self.imgsz = imgsz
         self.frame_skip = max(1, frame_skip)
+        # Must match the tracker built by build_tracker(): the detection
+        # layout fed to update() has to agree with the tracker's own mode.
+        self.task = normalize_task(task)
+        self._is_obb = self.task == TASK_OBB
 
     # ---- Class-level model cache (keyed by path) ----
 
@@ -136,26 +142,32 @@ class TrackingStepWorker(QtCore.QObject):
 
     @staticmethod
     def _assign_ids(obbs, det_aabbs, tracks):
-        if tracks is None or len(tracks) == 0:
+        """Map tracker IDs back onto the source annotations.
+
+        Layout-agnostic: ``parse_track_results`` hands back ids, det indices
+        and axis-aligned boxes whether the tracker ran in OBB or AABB mode.
+        """
+        ids, det_inds, trk_boxes = parse_track_results(tracks)
+        if len(ids) == 0:
             return obbs
-        trk_ids = tracks[:, 4].astype(int)
-        # Preferred path: BoxMOT returns the original detection index in col 7
-        if tracks.shape[1] >= 8:
-            det_indices = tracks[:, 7].astype(int)
-            for row, di in enumerate(det_indices):
+
+        # Preferred path: the tracker tells us which detection each track came
+        # from, so the mapping is exact.
+        if (det_inds >= 0).any():
+            for row, di in enumerate(det_inds):
                 if 0 <= di < len(obbs):
-                    obbs[di].track_id = int(trk_ids[row])
+                    obbs[di].track_id = int(ids[row])
             return obbs
-        # Fallback: greedy IoU match between detections and tracks
+
+        # Fallback for coasting-only frames: greedy IoU match.
         if not obbs or len(det_aabbs) == 0:
             return obbs
-        trk_boxes = tracks[:, :4]
         ious = iou_matrix(det_aabbs[:, :4], trk_boxes)
         used = set()
         for ti in range(len(trk_boxes)):
             best_det = int(ious[:, ti].argmax())
             if best_det not in used and ious[best_det, ti] > 0.3:
-                obbs[best_det].track_id = int(trk_ids[ti])
+                obbs[best_det].track_id = int(ids[ti])
                 used.add(best_det)
         return obbs
 
@@ -167,7 +179,7 @@ class TrackingStepWorker(QtCore.QObject):
             if YOLO is None:
                 raise RuntimeError("ultralytics not installed")
 
-            model_path = resolve_model_path(self.model_path, "obb")
+            model_path = resolve_model_path(self.model_path, self.task)
             model = self._get_model(model_path)
 
             frames = list(range(self.start_idx, self.end_idx + 1, self.frame_skip))
@@ -191,12 +203,15 @@ class TrackingStepWorker(QtCore.QObject):
                     verbose=False,
                 )
                 obbs = self._extract_obbs(results[0])
-                if obbs:
-                    det_aabbs = np.stack([obb_to_aabb_row(b) for b in obbs])
-                else:
-                    det_aabbs = np.empty((0, 6), dtype=np.float32)
 
-                tracks = self.tracker.update(det_aabbs, frame)
+                # Feed the tracker in its own layout: oriented rows keep the
+                # angle inside the motion model instead of flattening it.
+                dets = boxes_to_dets(obbs, self._is_obb)
+                tracks = self.tracker.update(dets, frame)
+
+                # The IoU fallback always works on axis-aligned boxes.
+                det_aabbs = (boxes_to_dets(obbs, False) if obbs
+                             else np.empty((0, 6), dtype=np.float32))
                 obbs = self._assign_ids(obbs, det_aabbs, tracks)
 
                 snap = extract_trajectories_from_tracker(self.tracker)
