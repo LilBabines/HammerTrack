@@ -10,21 +10,28 @@ Output columns:
   obb_x0, obb_y0, obb_x1, obb_y1, obb_x2, obb_y2, obb_x3, obb_y3,
   angle_image, angle_absolute, cohesion
 
-Track identity is the JSON filename stem (e.g. "shark_3"); the same string
-must be used as the column name in the angle and cohesion CSVs.
+Track identity is the JSON filename stem, verbatim (see ``track_io.track_id``);
+the same string is the column name in the angle and cohesion CSVs. Since every
+producer in the pipeline derives it the same way -- the GUI names the
+individual, ``track_postprocess.py`` keeps the stem, ``cohesion.py`` and
+``angle.py`` use it as the column header -- no renaming is needed anywhere.
+
+Note that ``angle_absolute`` holds ``delta_abs``: the deviation from the group
+reference heading in CMC-stabilised space, not an absolute compass bearing.
 
 Run `python scripts/merge_csv_per_track.py --help` for all options.
 """
 
 import argparse
 import csv
-import glob
 import json
 import os
 import sys
 from pathlib import Path
 
 import pandas as pd
+
+import track_io
 
 
 CSV_HEADER = [
@@ -59,7 +66,7 @@ def lookup(df, frame: int, track_id: str, fmt: str = "{:.6f}") -> str:
 def merge_track(path: str, fps: float, df_angle_img, df_angle_abs,
                 df_cohesion, out_dir: Path) -> int:
     """Write one merged CSV for a single track JSON. Returns the row count."""
-    track_id = Path(path).stem
+    track_id = track_io.track_id(path)
 
     with open(path) as f:
         data = json.load(f)
@@ -109,7 +116,9 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--tracks", required=True,
-                   help="Glob pattern OR directory of post-processed track .json files.")
+                   help="Directory OR glob of per-individual track .json files "
+                        "(<export_dir>/postp_tracks/, or .../individuals/ if you "
+                        "skipped post-processing).")
     p.add_argument("--output-dir", required=True,
                    help="Output directory for the per-track merged CSVs.")
     p.add_argument("--angle-image-csv", default=None,
@@ -131,11 +140,7 @@ def main():
     if args.fps <= 0:
         sys.exit(f"--fps must be > 0, got {args.fps}")
 
-    track_pattern = (str(Path(args.tracks) / args.pattern)
-                     if os.path.isdir(args.tracks) else args.tracks)
-    track_files = sorted(glob.glob(track_pattern))
-    if not track_files:
-        sys.exit(f"No track files found matching: {track_pattern}")
+    track_files = track_io.resolve_track_files(args.tracks, args.pattern)
 
     df_angle_img = load_indexed_csv(args.angle_image_csv, "angle_image")
     df_angle_abs = load_indexed_csv(args.angle_absolute_csv, "angle_absolute")

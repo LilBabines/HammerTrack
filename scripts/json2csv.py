@@ -1,5 +1,13 @@
 """
-Convert track JSON(s) to CSV.
+Convert track JSON(s) to CSV — legacy, frame-padded flat export.
+
+Superseded by ``merge_csv_per_track.py``, which produces the same geometry
+columns plus ``time_s``, angles and cohesion. Kept because the zero-padding to
+a fixed ``--end-frame`` is convenient for anything that wants one row per frame
+of the clip regardless of presence.
+
+Output CSVs are named after the input filename stem (the track identity, see
+``track_io.track_id``).
 
 Output columns:
   frame, centroid_x, centroid_y, interpolated,
@@ -12,21 +20,15 @@ Usage:
   python json_track_to_csv.py *.json --end-frame 20000
 """
 
-import os, json, argparse, csv
+import os, argparse, csv
 
-
-def load_json(p):
-    with open(p) as f:
-        return json.load(f)
+import track_io
 
 
 def convert(json_path, output_dir, end_frame):
-    track = load_json(json_path)
-
-    ids = track.get("merged_track_ids", [0])
-    label = "_".join(str(x) for x in ids)
-    base = os.path.splitext(os.path.basename(json_path))[0]
-    out_path = os.path.join(output_dir, f"{base}.csv")
+    track = track_io.load_track(json_path)
+    label = track["id"]
+    out_path = os.path.join(output_dir, f"{label}.csv")
 
     # Index detections by frame
     by_frame = {}
@@ -57,7 +59,7 @@ def convert(json_path, output_dir, end_frame):
                     obb_flat = [""] * 8
                 w.writerow([f, cx, cy, interp] + obb_flat)
 
-    print(f"  {out_path}  (track {label}, {len(by_frame)} dets, "
+    print(f"  {out_path}  ({label}, {len(by_frame)} dets, "
           f"frames 0..{end_frame})")
 
 

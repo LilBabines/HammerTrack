@@ -1,8 +1,15 @@
 """
 Render OBB + cohesion + compass on video.
 
+Input
+  Per-individual track JSONs, either the GUI export (<export_dir>/individuals/)
+  or the post-processed tracks (<export_dir>/postp_tracks/). Post-processed is
+  the sane default here: the OBB axis and the trajectory direction are both
+  smoothed over consecutive samples, so gaps in the series distort the angles.
+
 Track identity
-  Every track is identified by the stem of its JSON filename (e.g. "shark_3").
+  Every track is identified by the stem of its JSON filename, verbatim
+  (see track_io.track_id): "shark_3.json" -> "shark_3", "Bob.json" -> "Bob".
   This ID is used consistently for: video labels, CSV columns, cohesion lookup,
   and panel display.  There is NO dependency on merged_track_ids.
 
@@ -27,19 +34,17 @@ import json
 import argparse
 import numpy as np
 import pandas as pd
-from pathlib import Path
 from collections import defaultdict
 from scipy.signal import savgol_filter
+
+import track_io
 
 
 # ── JSON loaders ─────────────────────────────────────────────────────
 
 def load_track_json(p):
-    """Load a post-processed track JSON.  ID = filename stem (e.g. 'shark_3')."""
-    with open(p) as f:
-        track = json.load(f)
-    track["id"] = Path(p).stem          # "shark_3"
-    return track
+    """Load one track JSON. ID = filename stem, set by track_io.load_track."""
+    return track_io.load_track(p)
 
 
 def load_cmc_json(p):
@@ -325,31 +330,34 @@ def compute_group_ref_and_deltas(angles: dict, n_ref_frames: int):
 
 # ── Cohesion (loaded from precomputed CSV) ───────────────────────────
 
-def load_cohesion_csv(csv_path):
+def load_cohesion_csv(csv_path, track_ids=None):
     """
     Load cohesion CSV (one row per frame).
-    Columns expected: frame, T, shark_0, shark_1, …, cohesion_global
-    The shark_* column names must match the track file stems exactly.
-    Returns dict: {frame: (T, {track_id_str: cohesion_i}, cohesion_global)}
+    Columns expected: frame, <track_id>..., T, cohesion_global
+    Every column that is not reserved (frame / T / cohesion_global) is treated
+    as a per-track value, and its name must equal a track file stem exactly.
+    Returns dict: {frame: (T, {track_id: cohesion_i}, cohesion_global)}
     """
     df = pd.read_csv(csv_path)
     cohesion_lut = {}
 
-    # Detect shark_* columns (these are the per-track cohesion values)
-    coh_cols = [c for c in df.columns if c.startswith("shark_")]
+    # Per-track columns = everything that is not a reserved column name.
+    # (Was `startswith("shark_")`, which broke on any other naming.)
+    coh_cols = track_io.cohesion_track_columns(df.columns)
+    if track_ids is not None:
+        track_io.warn_missing_columns(track_ids, df.columns, "cohesion")
 
     for _, row in df.iterrows():
         f = int(row["frame"])
         T_val = row.get("T", None)
         T_val = float(T_val) if pd.notna(T_val) else None
 
-        # Keys are kept as column names ("shark_0", "shark_3", …)
-        # so they match track["id"] directly.
+        # Keys are kept as column names, so they match track["id"] directly.
         coh_per = {}
         for c in coh_cols:
             v = row.get(c, None)
             if pd.notna(v):
-                coh_per[c] = float(v)      # key = "shark_0" etc.
+                coh_per[c] = float(v)
 
         # "cohesion_globale" is the legacy (French) column name, still
         # accepted so previously generated CSVs keep working.
@@ -648,7 +656,9 @@ def render(
 
     # ── Cohesion ─────────────────────────────────────────────────────
     print("Loading cohesion CSV...")
-    cohesion_lut_raw = load_cohesion_csv(cohesion_csv_path)
+    cohesion_lut_raw = load_cohesion_csv(
+        cohesion_csv_path, track_ids=[t["id"] for t in tracks]
+    )
     print(f"  {len(cohesion_lut_raw)} frames loaded from {cohesion_csv_path}")
 
     # Map track["id"] (e.g. "shark_3") → render index (0, 1, 2…)
@@ -774,9 +784,6 @@ def render(
 
 
 if __name__ == "__main__":
-    import glob
-    import sys
-
     pa = argparse.ArgumentParser(
         description=(
             "Render an OBB + per-individual angle + group cohesion overlay on a "
@@ -791,13 +798,17 @@ if __name__ == "__main__":
     pa.add_argument("--video", required=True,
                     help="Path to the source clip (.mp4).")
     pa.add_argument("--tracks", required=True,
-                    help="Glob pattern OR directory of post-processed track .json files.")
+                    help="Directory OR glob of per-individual track .json files "
+                         "(<export_dir>/postp_tracks/, or .../individuals/ if you "
+                         "skipped post-processing).")
     pa.add_argument("--pattern", default="*.json",
                     help="Glob pattern used when --tracks is a directory.")
     pa.add_argument("--cmc", required=True,
                     help="Path to the camera-motion-compensation JSON (per-frame affine).")
     pa.add_argument("--cohesion-csv", required=True,
-                    help="Path to the per-frame cohesion CSV produced by scripts/cohesion.py.")
+                    help="Per-frame cohesion CSV from scripts/cohesion.py. Its "
+                         "per-track column names must match the track filename "
+                         "stems used here.")
     pa.add_argument("--output-video", required=True,
                     help="Output path for the rendered .mp4. The angle CSVs are written next "
                          "to it as <prefix>_angle_image.csv and <prefix>_angle_absolute.csv.")
@@ -829,14 +840,9 @@ if __name__ == "__main__":
     args = pa.parse_args()
 
     # Resolve --tracks: accept either a directory (uses --pattern) or a glob.
-    if os.path.isdir(args.tracks):
-        track_pattern = str(Path(args.tracks) / args.pattern)
-    else:
-        track_pattern = args.tracks
-    track_paths = sorted(glob.glob(track_pattern))
-    if not track_paths:
-        sys.exit(f"No track files found matching: {track_pattern}")
-    print(f"Found {len(track_paths)} tracks: {[Path(p).stem for p in track_paths]}")
+    track_paths = track_io.resolve_track_files(args.tracks, args.pattern)
+    print(f"Found {len(track_paths)} tracks: "
+          f"{[track_io.track_id(p) for p in track_paths]}")
 
     render(
         args.video, track_paths, args.cmc, args.cohesion_csv, args.output_video,

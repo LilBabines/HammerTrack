@@ -2,7 +2,18 @@
 cohesion.py
 ===========
 
-Compute a per-frame group-cohesion metric from post-processed track JSON files.
+Compute a per-frame group-cohesion metric from per-individual track JSON files.
+
+Input: either the GUI export (``<export_dir>/individuals/``) or the
+post-processed tracks (``<export_dir>/postp_tracks/``). Both schemas share the
+``detections`` list, so this script does not care which one it is given —
+though running it on post-processed tracks is what you usually want, since
+interpolation fills the frames where an individual would otherwise be absent.
+
+Track identity is the *filename stem*, verbatim (see ``track_io.track_id``):
+``individuals/shark_3.json`` -> column ``shark_3``, ``individuals/Bob.json``
+-> column ``Bob``. Those column names are what ``angle.py`` and
+``merge_csv_per_track.py`` look up, so nothing needs renaming downstream.
 
 For each frame independently:
   - T = median of all bbox diagonals present in that frame (scale).
@@ -13,59 +24,28 @@ For each frame independently:
   - cohesion_global = mean of cohesion_i over present individuals.
 
 Output: one CSV with columns
-    frame, shark_<id>..., T, cohesion_global
+    frame, <track_id>..., T, cohesion_global
 
 Run `python scripts/cohesion.py --help` for all options.
 """
 
 import argparse
-import glob
-import json
 import os
 import sys
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+import track_io
 
 
 # =============================================================================
 # Data loading
 # =============================================================================
 
-def load_tracks(tracks_arg: str, pattern: str = "*.json") -> dict:
-    """Load every track JSON file and return a dict {track_id: data}.
-
-    `tracks_arg` may be either a directory (in which case `pattern` is used)
-    or a glob pattern. Track IDs are derived from the filename suffix after
-    the last underscore.
-    """
-    if os.path.isdir(tracks_arg):
-        track_pattern = str(Path(tracks_arg) / pattern)
-    else:
-        track_pattern = tracks_arg
-
-    files = sorted(glob.glob(track_pattern))
-    if not files:
-        sys.exit(f"No track files found matching: {track_pattern}")
-
-    tracks = {}
-    for fpath in files:
-        with open(fpath, "r") as f:
-            data = json.load(f)
-        track_id = fpath[:-5].split("_")[-1]
-        tracks[track_id] = data
-    return tracks
-
-
 def build_frame_index(tracks: dict) -> dict:
     """For each track, build a dict {frame: detection}."""
-    frame_index = {}
-    for tid, data in tracks.items():
-        frame_index[tid] = {}
-        for det in data["detections"]:
-            frame_index[tid][det["frame"]] = det
-    return frame_index
+    return {tid: track_io.build_frame_index(data) for tid, data in tracks.items()}
 
 
 # =============================================================================
@@ -92,7 +72,7 @@ def compute_single_frame(frame: int, frame_index: dict, track_ids: list,
     # 2) Need at least 2 individuals to define cohesion
     if len(detections) < 2:
         for tid in track_ids:
-            row[f"shark_{tid}"] = np.nan
+            row[tid] = np.nan
         row["T"] = np.nan
         row["cohesion_global"] = np.nan
         return row
@@ -111,7 +91,7 @@ def compute_single_frame(frame: int, frame_index: dict, track_ids: list,
     cohesion_values = []
     for tid in track_ids:
         if tid not in centroids:
-            row[f"shark_{tid}"] = np.nan
+            row[tid] = np.nan
             continue
 
         dists = [
@@ -121,7 +101,7 @@ def compute_single_frame(frame: int, frame_index: dict, track_ids: list,
         ]
 
         ci = float(np.quantile(dists, quantile)) / T if (dists and T > 0) else np.nan
-        row[f"shark_{tid}"] = round(ci, 4) if not np.isnan(ci) else np.nan
+        row[tid] = round(ci, 4) if not np.isnan(ci) else np.nan
 
         if not np.isnan(ci):
             cohesion_values.append(ci)
@@ -179,7 +159,8 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--tracks", required=True,
-                   help="Glob pattern OR directory of post-processed track .json files.")
+                   help="Directory OR glob of per-individual track .json files "
+                        "(<export_dir>/individuals/ or .../postp_tracks/).")
     p.add_argument("--output-csv", required=True,
                    help="Output path for the cohesion CSV.")
     p.add_argument("--pattern", default="*.json",
@@ -194,8 +175,8 @@ def main():
     if not (0.0 <= args.quantile <= 1.0):
         sys.exit(f"--quantile must be in [0, 1], got {args.quantile}")
 
-    tracks = load_tracks(args.tracks, pattern=args.pattern)
-    print(f"Loaded {len(tracks)} tracks from {args.tracks}\n")
+    tracks = track_io.load_tracks_by_id(args.tracks, pattern=args.pattern)
+    print(f"Loaded {len(tracks)} individuals from {args.tracks}\n")
     compute_cohesion_per_frame(tracks, args.output_csv, quantile=args.quantile)
 
 

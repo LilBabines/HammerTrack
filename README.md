@@ -71,13 +71,75 @@ projects/<project_name>/
 - **`finetune_runs/`** — used as the Ultralytics log directory; each fine-tuning
   run saves its model weights and training metrics here.
 - **`export/`** — contains every exported tracking result and the display videos
-  rendered from the GUI.
+  rendered from the GUI. One subfolder per clip:
+
+```
+export/<clip_id>/
+├── per_frame/            # frame_XXXXXX.txt — one line per detection
+├── per_track/            # track_XXXX.json — one file per raw tracker fragment
+├── individuals/          # <name>.json — fragments MERGED per animal  ← pipeline input
+├── individuals.json      # the fragment → individual mapping
+├── cmc_transforms.json   # {"<frame>": affine 2x3} camera-motion compensation
+└── postp_tracks/         # <name>.json — written by scripts/track_postprocess.py
+```
+
+**Track identity.** A track is identified by the *stem of its JSON filename*,
+verbatim — `individuals/shark_3.json` is `shark_3`, `individuals/Bob.json` is
+`Bob`. Every script uses that same string for CSV column names, video labels and
+output filenames, and `scripts/track_postprocess.py` preserves it, so an
+individual named in the GUI needs no renaming anywhere downstream. The rule
+lives in one place: `scripts/track_io.py`.
 
 ## 📊 Features extraction
 
 Once tracks have been exported, several scripts in `scripts/` compute
-behavioural and group-level metrics from the trajectories. They are meant to be
-run **after** tracking, on the files stored in `projects/<project_name>/export/`.
+behavioural and group-level metrics from the trajectories. They all read
+per-individual track JSONs and are meant to be run **after** tracking, on the
+files stored in `projects/<project_name>/export/<clip_id>/`.
+
+Run them in this order — `angle.py` needs the cohesion CSV, and
+`merge_csv_per_track.py` needs both:
+
+```
+individuals/  ──► track_postprocess.py ──► postp_tracks/
+                                              ├──► cohesion.py ──► cohesion.csv
+                                              │                        │
+                                              ├──► angle.py ◄──────────┘
+                                              │       └──► *_angle_image.csv, *_angle_absolute.csv
+                                              ├──► keypoints_TBF.py ──► keypoints/*.csv
+                                              └──► merge_csv_per_track.py ──► merged/*.csv
+```
+
+- **`track_postprocess.py`** — *Numeric post-processing (run this first)*.
+
+    Refines the per-individual trajectories exported by the GUI and re-emits
+them under the same filename stem. **Merging is not done here**: the GUI owns
+identity (it groups tracker fragments into individuals and resolves frame
+collisions), so this script only applies the numeric passes, in order:
+
+  * **outlier removal** — drop detections whose displacement from the previous
+one exceeds `--max-jump-px` (or a z-score cutoff). Measured in the CMC
+reference frame when `--cmc` is given, so a fast camera pan is not mistaken
+for a teleporting shark,
+  * **interpolation** — fill every missing frame between the first and last
+detection, in the CMC reference frame, marking the result
+`interpolated: true` with `confidence: 0.0` and no OBB,
+  * **smoothing** — Savitzky-Golay (or moving average) on the centroids.
+
+    Each pass can be disabled (`--outlier-method none`, `--interp-method none`,
+`--smooth-method none`), and the passes actually applied are recorded in a
+`postprocess` field in the output JSON. Identity keys (`uid`, `name`, `notes`,
+`color`, `merged_track_ids`) pass through untouched.
+
+    Required arguments: `--tracks`, `--output-dir`. Strongly recommended:
+`--cmc`. Optional: `--video` + `--render-video` for a QC overlay.
+
+  ```bash
+  python scripts/track_postprocess.py \
+      --tracks     projects/<project_name>/export/<clip_id>/individuals/ \
+      --output-dir projects/<project_name>/export/<clip_id>/postp_tracks/ \
+      --cmc        projects/<project_name>/export/<clip_id>/cmc_transforms.json
+  ```
 
 - **`keypoints_TBF.py`** — *Skeletal keypoints + Tail Beat Frequency*.
 
@@ -153,6 +215,28 @@ run **after** tracking, on the files stored in `projects/<project_name>/export/`
       --quantile   0.25
   ```
 
+- **`merge_csv_per_track.py`** — *One consolidated CSV per individual*.
+
+    Joins the post-processed track JSON with the angle CSVs and the cohesion CSV
+into a single per-individual table: `frame, time_s, centroid_x, centroid_y,
+interpolated, obb_x0..obb_y3, angle_image, angle_absolute, cohesion`. The join
+key is the track identity, so nothing needs renaming.
+
+    Note that `angle_absolute` holds `delta_abs` — the deviation from the group
+reference heading in CMC-stabilised space, not an absolute compass bearing.
+
+    Required arguments: `--tracks`, `--output-dir`. Optional:
+`--angle-image-csv`, `--angle-absolute-csv`, `--cohesion-csv`, `--fps`.
+
+  ```bash
+  python scripts/merge_csv_per_track.py \
+      --tracks              projects/<project_name>/export/<clip_id>/postp_tracks/ \
+      --output-dir          projects/<project_name>/export/<clip_id>/merged/ \
+      --angle-image-csv     projects/<project_name>/export/<clip_id>/display_angle_angle_image.csv \
+      --angle-absolute-csv  projects/<project_name>/export/<clip_id>/display_angle_angle_absolute.csv \
+      --cohesion-csv        projects/<project_name>/export/<clip_id>/cohesion.csv
+  ```
+
 - **`angle.py`** — *Per-individual angle, group orientation & overlay video*.
 
   Renders a full diagnostic video on top of the clip, plus per-track angle
@@ -187,7 +271,7 @@ run **after** tracking, on the files stored in `projects/<project_name>/export/`
   python scripts/angle.py \
       --video        clips/selected/<clip_name>.mp4 \
       --tracks       projects/<project_name>/export/<clip_id>/postp_tracks/ \
-      --cmc          projects/<project_name>/export/<clip_id>/cmc.json \
+      --cmc          projects/<project_name>/export/<clip_id>/cmc_transforms.json \
       --cohesion-csv projects/<project_name>/export/<clip_id>/cohesion.csv \
       --output-video projects/<project_name>/export/<clip_id>/display_angle.mp4
   ```

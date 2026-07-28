@@ -6,8 +6,18 @@ Extract per-track skeletal keypoints (head, center-of-mass, two articulations,
 tail) and articular/directional angles from existing tracks, using SAM2 to
 re-segment each instance frame by frame.
 
+Input: per-individual track JSONs, either the GUI export
+(``<export_dir>/individuals/``) or the post-processed tracks
+(``<export_dir>/postp_tracks/``). Post-processed is preferable: SAM2 is
+prompted from the bbox/centroid of each detection, so interpolated frames give
+the segmenter a prompt where the tracker had none.
+
+Track identity is the filename stem, verbatim (see ``track_io.track_id``), and
+is used for the output CSV name and the on-screen label — so ``Bob.json``
+yields ``Bob.csv``, matching the column ``Bob`` in the cohesion and angle CSVs.
+
 Outputs:
-    - one CSV per track in --csv-dir
+    - one CSV per track in --csv-dir, named ``<track_id>.csv``
     - a rendered "skeleton" display video at --output-video
 
 Run `python scripts/keypoints_TBF.py --help` for all options.
@@ -17,9 +27,7 @@ import os
 import sys
 import argparse
 import subprocess
-import json
 import csv
-import glob
 import shutil
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +37,8 @@ import torch
 import cv2
 from sam2.build_sam import build_sam2_video_predictor
 from skimage.morphology import skeletonize
+
+import track_io
 
 
 # =============================================================================
@@ -403,7 +413,11 @@ def parse_args():
     p.add_argument("--frames-dir", required=True,
                    help="Directory containing frames as 000000.jpg, 000001.jpg, ...")
     p.add_argument("--tracks", required=True,
-                   help="Glob pattern OR directory of post-processed track .json files.")
+                   help="Directory OR glob of per-individual track .json files "
+                        "(<export_dir>/postp_tracks/, or .../individuals/ if you "
+                        "skipped post-processing).")
+    p.add_argument("--pattern", default="*.json",
+                   help="Glob pattern used when --tracks is a directory.")
     p.add_argument("--output-video", required=True,
                    help="Output path for the rendered skeleton video (.mp4).")
     p.add_argument("--csv-dir", required=True,
@@ -456,14 +470,9 @@ def main():
     args = parse_args()
 
     # --- Resolve track files (accept either a directory or a glob pattern) ---
-    if os.path.isdir(args.tracks):
-        track_pattern = os.path.join(args.tracks, "*.json")
-    else:
-        track_pattern = args.tracks
-    track_files = sorted(glob.glob(track_pattern))
-    print(f"Found {len(track_files)} tracks: {[os.path.basename(f) for f in track_files]}")
-    if not track_files:
-        sys.exit(f"No track files found matching: {track_pattern}")
+    track_files = track_io.resolve_track_files(args.tracks, args.pattern)
+    track_ids = [track_io.track_id(f) for f in track_files]
+    print(f"Found {len(track_files)} tracks: {track_ids}")
 
     plot_margin = not args.no_graph
     show_video = not args.no_display
@@ -495,36 +504,37 @@ def main():
     print(f"Original: {orig_w}x{orig_h} -> Scale: {scale_x:.3f}, {scale_y:.3f}")
 
     # --- Load all tracks ---
+    # SAM2 object IDs must be integers, so the enumeration index stays the
+    # internal key; `name` carries the pipeline identity (the filename stem).
     tracks = {}
     for tid, path in enumerate(track_files):
-        with open(path) as f:
-            data = json.load(f)
+        data = track_io.load_track(path)
         dets = data["detections"]
         color = TRACK_COLORS[tid % len(TRACK_COLORS)]
         tracks[tid] = {
+            "name": data["id"],
             "detections": dets,
             "det_by_frame": {d["frame"]: d for d in dets},
             "first_frame": data.get("first_frame", dets[0]["frame"] if dets else 0),
             "last_frame": data.get("last_frame", dets[-1]["frame"] if dets else 0),
             "color": color,
         }
-        print(f"Track {tid}: frames {tracks[tid]['first_frame']}-{tracks[tid]['last_frame']} "
-              f"({len(dets)} dets)")
+        print(f"{data['id']} (obj {tid}): frames {tracks[tid]['first_frame']}-"
+              f"{tracks[tid]['last_frame']} ({len(dets)} dets)")
 
     track_colors = {tid: t["color"] for tid, t in tracks.items()}
 
     best_track_tid = max(tracks, key=lambda tid: sum(
         1 for d in tracks[tid]["detections"] if not d.get("interpolated", False)
     ))
-    print(f"Best track for graph: {best_track_tid} "
+    print(f"Best track for graph: {tracks[best_track_tid]['name']} "
           f"({sum(1 for d in tracks[best_track_tid]['detections'] if not d.get('interpolated', False))} real dets)")
 
     # --- CSV writers ---
     csv_files = {}
     csv_writers = {}
-    for tid, path in enumerate(track_files):
-        basename = os.path.splitext(os.path.basename(path))[0]
-        csv_path = os.path.join(args.csv_dir, f"{basename}.csv")
+    for tid in tracks:
+        csv_path = os.path.join(args.csv_dir, f"{tracks[tid]['name']}.csv")
         f = open(csv_path, "w", newline="")
         w_csv = csv.writer(f)
         w_csv.writerow(CSV_HEADER)
