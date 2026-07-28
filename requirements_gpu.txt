@@ -1,3 +1,8 @@
+# GPU environment snapshot for HammerTrack.
+# Regenerate on the target machine with: pip freeze > requirements_gpu.txt
+# torch/torchvision carry a +cu128 local version tag: install them from
+# the matching PyTorch index, see https://pytorch.org/get-started/locally/
+
 annotated-doc==0.0.4
 antlr4-python3-runtime==4.9.3
 anyio==4.13.0
@@ -94,8 +99,8 @@ triton==3.6.0
 typer==0.25.0
 typing_extensions==4.15.0
 tzdata==2026.2
-ultralytics==8.4.41
-ultralytics-thop==2.0.19
+ultralytics==8.4.108
+ultralytics-thop==2.1.0
 urllib3==2.6.3
 wcwidth==0.6.0
 yacs==0.1.8

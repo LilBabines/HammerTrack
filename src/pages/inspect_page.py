@@ -13,8 +13,9 @@ import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..utils import OBBOX, cvimg_to_qimage, ensure_bgr_u8
-from ..workers import DetectionWorker, YOLO_MODEL_PATH, resolve_model_path
+from ..tasks import TASK_OBB, TASK_POSE, normalize_task
+from ..utils import OBBOX, cvimg_to_qimage, draw_keypoints, ensure_bgr_u8
+from ..workers import DetectionWorker, resolve_model_path
 
 if TYPE_CHECKING:
     from ..windows import LauncherWindow
@@ -112,6 +113,36 @@ class InspectDatasetPage(QtWidgets.QWidget):
 
     def refresh(self):
         self._load_split(self.split_combo.currentText())
+
+    def unload_project(self):
+        """Forget the previous project's dataset and reload from the new one.
+
+        ``_load_split`` reads ``dataset_dir`` from the launcher's *current*
+        config, so re-running it after the project changed is enough to point
+        the browser at the new dataset; the caches are cleared first so
+        nothing from the old project can be displayed in between.
+        """
+        self._items.clear()
+        self._pred_cache.clear()
+        self._current = 0
+        self._show_preds = False
+        self.show_preds_chk.setChecked(False)
+        self._clear_canvas()
+        self.stats_label.setText("No dataset loaded.")
+
+        # Back to the default split: "val" may not even exist in the new
+        # project, and _load_split() handles a missing folder gracefully.
+        self.split_combo.blockSignals(True)
+        self.split_combo.setCurrentText("train")
+        self.split_combo.blockSignals(False)
+
+        self.refresh()
+
+    def _task(self) -> str:
+        """Project task; drives both label parsing and keypoint rendering."""
+        if self._launcher:
+            return normalize_task(self._launcher.project_config().get("task_type"))
+        return TASK_OBB
 
     def _dataset_dir(self) -> str:
         if self._launcher:
@@ -232,11 +263,13 @@ class InspectDatasetPage(QtWidgets.QWidget):
         h, w = img.shape[:2]
         conf_thresh = self.conf_spin.value()
 
-        # Draw GT boxes (green)
-        gt_boxes = self._parse_label(item["lbl"], w, h)
+        # Draw GT boxes (green) — keypoints too on a pose dataset
+        gt_boxes = self._parse_label(item["lbl"], w, h, task=self._task())
         for box in gt_boxes:
             pts = box.poly.reshape(-1, 2).astype(int)
             cv2.polylines(img, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+            if box.has_keypoints():
+                draw_keypoints(img, box.keypoints, (0, 255, 0), radius=4)
 
         # Draw predictions (yellow) if enabled
         if self._show_preds and self._current in self._pred_cache:
@@ -246,6 +279,8 @@ class InspectDatasetPage(QtWidgets.QWidget):
                     continue
                 pts = box.poly.reshape(-1, 2).astype(int)
                 cv2.polylines(img, [pts], True, (255, 255, 0), 2, cv2.LINE_AA)
+                if box.has_keypoints():
+                    draw_keypoints(img, box.keypoints, (255, 255, 0), radius=4)
                 x0, y0 = int(pts[0, 0]), int(pts[0, 1])
                 label = f"{box.conf:.2f}"
                 (tw, th_), base = cv2.getTextSize(
@@ -295,15 +330,21 @@ class InspectDatasetPage(QtWidgets.QWidget):
     # ==================== Label parsing (OBB vs BBOX auto-detect) ====================
 
     @staticmethod
-    def _parse_label(lbl_path: str, img_w: int, img_h: int) -> List[OBBOX]:
-        """Parse a YOLO label file. Auto-detects format:
+    def _parse_label(lbl_path: str, img_w: int, img_h: int,
+                     task: str = TASK_OBB) -> List[OBBOX]:
+        """Parse a YOLO label file for a given task.
 
-        * 9+ tokens → OBB:  ``cls x1 y1 x2 y2 x3 y3 x4 y4`` (normalized)
-        * 5  tokens → BBOX: ``cls cx cy w h`` (normalized)
+        * ``detect`` → ``cls cx cy w h``                     (5 tokens)
+        * ``obb``    → ``cls x1 y1 x2 y2 x3 y3 x4 y4``       (9 tokens)
+        * ``pose``   → ``cls cx cy w h x1 y1 ... xN yN``     (5 + 2N tokens)
+
+        The task must be supplied rather than guessed: a 2-keypoint pose line
+        has 9 tokens, exactly like an OBB line, so counting is ambiguous.
         """
         if not lbl_path or not os.path.isfile(lbl_path):
             return []
 
+        task = normalize_task(task)
         boxes: List[OBBOX] = []
         try:
             with open(lbl_path, "r") as f:
@@ -313,26 +354,41 @@ class InspectDatasetPage(QtWidgets.QWidget):
                         continue
                     cls_id = int(parts[0])
 
-                    if len(parts) >= 9:
-                        # OBB: cls x1 y1 x2 y2 x3 y3 x4 y4
+                    if task == TASK_OBB and len(parts) >= 9:
                         coords = [float(x) for x in parts[1:9]]
                         pts = np.array(coords, dtype=np.float32).reshape(4, 2)
                         pts[:, 0] *= img_w
                         pts[:, 1] *= img_h
                         boxes.append(OBBOX(poly=pts, cls_id=cls_id, conf=1.0))
-                    else:
-                        # BBOX: cls cx cy w h (normalized)
-                        cx = float(parts[1]) * img_w
-                        cy = float(parts[2]) * img_h
-                        bw = float(parts[3]) * img_w
-                        bh = float(parts[4]) * img_h
-                        x1, y1 = cx - bw / 2, cy - bh / 2
-                        x2, y2 = cx + bw / 2, cy + bh / 2
-                        pts = np.array(
-                            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
-                            dtype=np.float32,
-                        )
-                        boxes.append(OBBOX(poly=pts, cls_id=cls_id, conf=1.0))
+                        continue
+
+                    # detect and pose share the same leading box description
+                    cx = float(parts[1]) * img_w
+                    cy = float(parts[2]) * img_h
+                    bw = float(parts[3]) * img_w
+                    bh = float(parts[4]) * img_h
+                    x1, y1 = cx - bw / 2, cy - bh / 2
+                    x2, y2 = cx + bw / 2, cy + bh / 2
+                    pts = np.array(
+                        [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                        dtype=np.float32,
+                    )
+
+                    kpts = None
+                    if task == TASK_POSE and len(parts) > 5:
+                        flat = [float(v) for v in parts[5:]]
+                        # Trailing visibility flags (kpt_shape [N, 3]) are
+                        # tolerated so datasets written elsewhere still load.
+                        stride = 3 if len(flat) % 3 == 0 and len(flat) % 2 else 2
+                        arr = np.array(flat, dtype=np.float32)
+                        arr = arr[: (len(arr) // stride) * stride]
+                        arr = arr.reshape(-1, stride)[:, :2]
+                        arr[:, 0] *= img_w
+                        arr[:, 1] *= img_h
+                        kpts = arr if len(arr) else None
+
+                    boxes.append(OBBOX(poly=pts, cls_id=cls_id, conf=1.0,
+                                       keypoints=kpts))
         except Exception:
             pass
         return boxes
@@ -350,10 +406,8 @@ class InspectDatasetPage(QtWidgets.QWidget):
             return
 
         cfg = self._launcher.project_config()
-        model_path = cfg.get("model_path", YOLO_MODEL_PATH)
-        task = cfg.get("task_type", "auto")
-        if task == "auto":
-            task = "detect"
+        model_path = cfg.get("model_path", "")
+        task = self._task()
         conf = self.conf_spin.value()
 
         self.run_pred_btn.setEnabled(False)
@@ -368,6 +422,7 @@ class InspectDatasetPage(QtWidgets.QWidget):
             conf=conf,
             imgsz=cfg.get("imgsz", 1024),
             model_path=resolve_model_path(model_path, task),
+            task=task,
             source_path=item["img"],
         )
         self._pred_worker.moveToThread(self._pred_thread)

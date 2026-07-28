@@ -328,7 +328,7 @@ def compute_group_ref_and_deltas(angles: dict, n_ref_frames: int):
 def load_cohesion_csv(csv_path):
     """
     Load cohesion CSV (one row per frame).
-    Columns expected: frame, T, shark_0, shark_1, …, cohesion_globale
+    Columns expected: frame, T, shark_0, shark_1, …, cohesion_global
     The shark_* column names must match the track file stems exactly.
     Returns dict: {frame: (T, {track_id_str: cohesion_i}, cohesion_global)}
     """
@@ -336,8 +336,7 @@ def load_cohesion_csv(csv_path):
     cohesion_lut = {}
 
     # Detect shark_* columns (these are the per-track cohesion values)
-    coh_cols = [c for c in df.columns
-                if c.startswith("shark_") and c != "cohesion_globale"]
+    coh_cols = [c for c in df.columns if c.startswith("shark_")]
 
     for _, row in df.iterrows():
         f = int(row["frame"])
@@ -352,7 +351,9 @@ def load_cohesion_csv(csv_path):
             if pd.notna(v):
                 coh_per[c] = float(v)      # key = "shark_0" etc.
 
-        coh_global = row.get("cohesion_globale", None)
+        # "cohesion_globale" is the legacy (French) column name, still
+        # accepted so previously generated CSVs keep working.
+        coh_global = row.get("cohesion_global", row.get("cohesion_globale", None))
         coh_global = float(coh_global) if pd.notna(coh_global) else None
 
         cohesion_lut[f] = (T_val, coh_per, coh_global)

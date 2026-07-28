@@ -16,10 +16,9 @@ Built-in interactions (handled internally, parent doesn't see them):
 
 from typing import Optional
 
+import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
-
-from .utils import cvimg_to_qimage
 
 
 class AnnotationCanvas(QtWidgets.QLabel):
@@ -61,6 +60,11 @@ class AnnotationCanvas(QtWidgets.QLabel):
 
         # Frame state
         self._frame_bgr: Optional[np.ndarray] = None
+        # QImage does not copy the buffer it is built from, so the RGB array
+        # must outlive it: keeping it here prevents a dangling pointer.
+        self._rgb_buffer: Optional[np.ndarray] = None
+        # Nearest-neighbour resampling while a video is playing.
+        self._fast_scaling = False
         # Last computed display↔image mapping
         self._draw_map: dict = {
             "scale": 1.0, "xoff": 0, "yoff": 0,
@@ -79,33 +83,66 @@ class AnnotationCanvas(QtWidgets.QLabel):
     def has_frame(self) -> bool:
         return self._frame_bgr is not None
 
+    def set_fast_scaling(self, fast: bool):
+        """Trade resampling quality for speed (used during playback)."""
+        self._fast_scaling = bool(fast)
+
     def refresh(self):
-        """Redraw the cached frame using the current zoom & pan."""
+        """Redraw the cached frame using the current zoom & pan.
+
+        Only the part of the frame that actually lands inside the widget is
+        colour-converted and resampled. Rendering therefore costs about the
+        same whatever the source resolution or the zoom level, instead of
+        building a full-resolution pixmap every time — which at high zoom on
+        4K footage would also mean allocating gigabytes.
+        """
         if self._frame_bgr is None:
             self.clear()
             return
 
-        qimg = cvimg_to_qimage(self._frame_bgr)
-        img_w, img_h = qimg.width(), qimg.height()
-        lbl_w, lbl_h = self.width(), self.height()
+        img_h, img_w = self._frame_bgr.shape[:2]
+        lbl_w, lbl_h = max(1, self.width()), max(1, self.height())
         base = min(lbl_w / img_w, lbl_h / img_h) if img_w and img_h else 1.0
         scale = base * float(self.zoom)
-        disp_w, disp_h = int(img_w * scale), int(img_h * scale)
+        disp_w, disp_h = max(1, int(img_w * scale)), max(1, int(img_h * scale))
         xoff = (lbl_w - disp_w) // 2
         yoff = (lbl_h - disp_h) // 2
+        draw_x = xoff - float(self.pan_img[0]) * scale
+        draw_y = yoff - float(self.pan_img[1]) * scale
 
         canvas = QtGui.QPixmap(lbl_w, lbl_h)
         canvas.fill(QtGui.QColor(17, 17, 17))
-        painter = QtGui.QPainter(canvas)
-        scaled = QtGui.QPixmap.fromImage(qimg).scaled(
-            disp_w, disp_h,
-            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-            QtCore.Qt.TransformationMode.SmoothTransformation,
-        )
-        draw_x = int(xoff - self.pan_img[0] * scale)
-        draw_y = int(yoff - self.pan_img[1] * scale)
-        painter.drawPixmap(draw_x, draw_y, scaled)
-        painter.end()
+
+        # Source-image rectangle currently visible in the widget.
+        x0 = max(0, int(np.floor(-draw_x / scale)))
+        y0 = max(0, int(np.floor(-draw_y / scale)))
+        x1 = min(img_w, int(np.ceil((lbl_w - draw_x) / scale)))
+        y1 = min(img_h, int(np.ceil((lbl_h - draw_y) / scale)))
+
+        if x1 > x0 and y1 > y0:
+            crop = self._frame_bgr[y0:y1, x0:x1]
+            out_w = max(1, int(round((x1 - x0) * scale)))
+            out_h = max(1, int(round((y1 - y0) * scale)))
+            if self._fast_scaling:
+                interp = cv2.INTER_NEAREST
+            else:
+                interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            view = cv2.resize(crop, (out_w, out_h), interpolation=interp)
+
+            self._rgb_buffer = np.ascontiguousarray(
+                cv2.cvtColor(view, cv2.COLOR_BGR2RGB)
+            )
+            qimg = QtGui.QImage(
+                self._rgb_buffer.data, out_w, out_h, 3 * out_w,
+                QtGui.QImage.Format.Format_RGB888,
+            )
+            painter = QtGui.QPainter(canvas)
+            painter.drawPixmap(
+                int(round(draw_x + x0 * scale)),
+                int(round(draw_y + y0 * scale)),
+                QtGui.QPixmap.fromImage(qimg),
+            )
+            painter.end()
 
         self._draw_map = {
             "scale": scale, "xoff": xoff, "yoff": yoff,

@@ -14,39 +14,32 @@ except ImportError:
     YOLO = None
 
 # ------ Local imports ------
+from .tasks import (
+    TASK_DETECT, TASK_POSE,
+    default_model_for, is_pretrained_name, normalize_task, validate_pretrained,
+)
 from .utils import OBBOX, rect_to_poly_xyxy
 
 
-YOLO_MODEL_PATH = ""
+def resolve_model_path(model_path: str, task: str = TASK_DETECT) -> str:
+    """Return usable inference weights for ``task``.
 
-# ---------------------------------------------------------------------------
-# Default fallback weights — ultralytics auto-downloads these on first use.
-# Used by `resolve_model_path` when the configured path is empty or missing.
-# ---------------------------------------------------------------------------
-DEFAULT_MODEL_DETECT = "yolo26m.pt"
-DEFAULT_MODEL_OBB    = "yolo26m-obb.pt"
-
-
-def resolve_model_path(model_path: str, task: str = "detect") -> str:
-    """Return ``model_path`` if it points to an existing file on disk,
-    otherwise a sensible default that ultralytics will auto-download.
-
-    Args:
-        model_path: User-configured path (may be empty or missing).
-        task:       Either ``"obb"`` or ``"detect"`` (anything else is treated
-                    as ``"detect"``).
-
-    Defaults:
-        task == "obb"  → ``DEFAULT_MODEL_OBB``  (currently ``yolo26m-obb.pt``)
-        otherwise      → ``DEFAULT_MODEL_DETECT`` (currently ``yolo26m.pt``)
+    ``model_path`` wins when it points at an existing file (fine-tuned weights)
+    or is already an official pretrained name that ultralytics can download on
+    demand. Otherwise the task's default pretrained checkpoint is used.
     """
     if model_path and os.path.isfile(model_path):
         return model_path
-    fallback = DEFAULT_MODEL_OBB if task == "obb" else DEFAULT_MODEL_DETECT
-    print(
-        f"[resolve_model_path] '{model_path}' not found — "
-        f"falling back to '{fallback}' (task={task})"
-    )
+    if is_pretrained_name(model_path):
+        # Not on disk yet, but ultralytics fetches it on first use.
+        return model_path
+
+    fallback = default_model_for(task)
+    if model_path:
+        print(
+            f"[resolve_model_path] '{model_path}' not found — "
+            f"falling back to '{fallback}' (task={task})"
+        )
     return fallback
 
 
@@ -99,8 +92,9 @@ class DetectionWorker(QtCore.QObject):
         frame_bgr: np.ndarray = None,
         conf: float = 0.5,
         imgsz: int = 1024,
-        model_path: str = YOLO_MODEL_PATH,
+        model_path: str = "",
         source_path: str = None,
+        task: str = TASK_DETECT,
     ):
         super().__init__()
         self.frame_idx = frame_idx
@@ -109,6 +103,19 @@ class DetectionWorker(QtCore.QObject):
         self.model_path = model_path
         self.imgsz = imgsz
         self.source_path = source_path
+        self.task = normalize_task(task)
+
+    @classmethod
+    def clear_model_cache(cls):
+        """Drop the cached model (and free its GPU memory).
+
+        The cache lives on the class and is shared by every page, so it has to
+        be dropped when the project changes: the next project may well be a
+        different task, and keeping the old weights resident wastes VRAM.
+        """
+        for attr in ("_model", "_model_path", "_model_task"):
+            if hasattr(cls, attr):
+                delattr(cls, attr)
 
     @classmethod
     def _get_model(cls, model_path: str):
@@ -120,6 +127,39 @@ class DetectionWorker(QtCore.QObject):
             cls._model_task = getattr(cls._model, "task", "detect")
             print(f"[DetectionWorker] Model task: {cls._model_task}")
         return cls._model
+
+    @staticmethod
+    def _parse_pose(res) -> List[OBBOX]:
+        """Build annotations from a pose result: box + (K, 2) keypoints.
+
+        ``res.keypoints`` may be absent when the model is not a pose model, in
+        which case the boxes are still returned without keypoints rather than
+        dropping the detections entirely.
+        """
+        out: List[OBBOX] = []
+        xyxy = res.boxes.xyxy.cpu().numpy()
+        cls_ids = res.boxes.cls.cpu().numpy()
+        confs = res.boxes.conf.cpu().numpy()
+
+        kpts = None
+        kp_obj = getattr(res, "keypoints", None)
+        if kp_obj is not None and getattr(kp_obj, "xy", None) is not None:
+            arr = kp_obj.xy
+            kpts = arr.cpu().numpy() if hasattr(arr, "cpu") else np.asarray(arr)
+
+        for i, ((x1, y1, x2, y2), c, sc) in enumerate(zip(xyxy, cls_ids, confs)):
+            kp = None
+            if kpts is not None and i < len(kpts):
+                candidate = np.asarray(kpts[i], dtype=np.float32).reshape(-1, 2)
+                # A model that found no keypoints reports them all at the
+                # origin; keeping those would poison the annotations.
+                if len(candidate) and not np.allclose(candidate, 0.0):
+                    kp = candidate
+            out.append(OBBOX(
+                poly=rect_to_poly_xyxy(x1, y1, x2, y2),
+                cls_id=int(c), conf=float(sc), keypoints=kp,
+            ))
+        return out
 
     @QtCore.Slot()
     def run(self):
@@ -154,7 +194,6 @@ class DetectionWorker(QtCore.QObject):
             res = results[0]
             names = getattr(model, "names", None)
 
-            # --- Debug ---
             has_obb = (
                 hasattr(res, "obb")
                 and res.obb is not None
@@ -164,8 +203,12 @@ class DetectionWorker(QtCore.QObject):
 
             boxes: List[OBBOX] = []
 
+            # --- Pose path: axis-aligned box + keypoints ---
+            if self.task == TASK_POSE and has_boxes:
+                boxes = self._parse_pose(res)
+
             # --- OBB path ---
-            if has_obb:
+            elif has_obb:
                 obb = res.obb
                 polys = getattr(obb, "xyxyxyxy", None)
                 cls = getattr(obb, "cls", None)
@@ -253,18 +296,22 @@ class DetectFinetuneWorker(QtCore.QObject):
     def __init__(
         self,
         class_names: List[str],
-        base_model_path: str,
+        base_model: str,
+        data_yaml: str,
+        task: str = TASK_DETECT,
         out_root: Optional[str] = None,
         epochs: int = 20,
         imgsz: int = 1024,
         batch: int = 8,
         val_split: float = 0.1,
         seed: int = 1337,
-        data_yaml: str = "datasets/datasets_build/dataset.yaml",
     ):
         super().__init__()
         self.class_names = class_names
-        self.base_model_path = base_model_path
+        # Always an official pretrained checkpoint name, never custom weights
+        # (see the validation in run()).
+        self.base_model = base_model
+        self.task = normalize_task(task)
         self.out_root = out_root or os.path.join(os.getcwd(), "finetune_runs")
         self.epochs = int(epochs)
         self.imgsz = int(imgsz)
@@ -272,6 +319,19 @@ class DetectFinetuneWorker(QtCore.QObject):
         self.val_split = float(val_split)
         self.seed = int(seed)
         self.data_yaml = data_yaml
+
+    def _warn_if_flip_idx_missing(self):
+        """Warn when data.yaml lacks flip_idx, which mutes flip augmentation."""
+        try:
+            with open(self.data_yaml, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            return
+        if "flip_idx" not in content:
+            self.log_line.emit(
+                "WARNING: data.yaml has no 'flip_idx' — ultralytics will "
+                "disable flip augmentation for this pose run."
+            )
 
     @QtCore.Slot()
     def run(self):
@@ -286,19 +346,38 @@ class DetectFinetuneWorker(QtCore.QObject):
                 raise RuntimeError(
                     "Ultralytics is not installed. `pip install ultralytics`"
                 )
-            if not os.path.isfile(self.base_model_path):
-                raise FileNotFoundError(
-                    f"Base model not found: {self.base_model_path}"
-                )
             if not self.class_names:
                 raise ValueError(
                     "class_names is empty; cannot write dataset.yaml."
                 )
+            if not os.path.isfile(self.data_yaml):
+                raise FileNotFoundError(
+                    f"Dataset config not found: {self.data_yaml}\n"
+                    f"Export the dataset before training."
+                )
+
+            # Fine-tuning must always restart from the official pretrained
+            # backbone. Training on top of a previous run's weights would
+            # compound drift across active-learning iterations.
+            ok, reason = validate_pretrained(self.base_model, self.task)
+            if not ok:
+                raise ValueError(reason)
 
             ts = time.strftime("%Y%m%d-%H%M%S")
             run_dir = os.path.join(self.out_root, f"run-{ts}")
 
-            model = YOLO(self.base_model_path)
+            # Bare official names are downloaded by ultralytics on first use.
+            self.log_line.emit(
+                f"=== Base model: {self.base_model} (pretrained, task={self.task}) ==="
+            )
+            model = YOLO(self.base_model)
+
+            loaded_task = getattr(model, "task", None)
+            if loaded_task and loaded_task != self.task:
+                raise ValueError(
+                    f"Loaded model reports task '{loaded_task}' but the "
+                    f"project task is '{self.task}'."
+                )
 
             # --- Register ultralytics callbacks for per-epoch progress ---
             total_epochs = self.epochs
@@ -342,6 +421,13 @@ class DetectFinetuneWorker(QtCore.QObject):
                 f"imgsz={self.imgsz}, batch={self.batch} ==="
             )
 
+            # Flips are safe for pose too: ultralytics remaps keypoints with
+            # data.yaml's flip_idx on BOTH the vertical and horizontal flip.
+            # It silently disables them when flip_idx is missing, so the check
+            # below turns that into a visible warning instead.
+            if self.task == TASK_POSE:
+                self._warn_if_flip_idx_missing()
+
             model.train(
                 data=self.data_yaml,
                 epochs=self.epochs,
@@ -351,6 +437,7 @@ class DetectFinetuneWorker(QtCore.QObject):
                 name="finetune",
                 exist_ok=True,
                 verbose=True,
+                seed=self.seed,
                 flipud=0.5,
                 fliplr=0.5,
             )

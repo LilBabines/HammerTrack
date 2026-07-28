@@ -24,11 +24,8 @@ try:
 except ImportError:  # pragma: no cover
     torch = None
 
-try:
-    from boxmot.trackers import BotSort
-    BOXMOT_AVAILABLE = True
-except ImportError:
-    BOXMOT_AVAILABLE = False
+
+from boxmot.trackers.bbox.botsort import BotSort
 
 
 # ==================== Tracker factory ====================
@@ -40,8 +37,6 @@ def build_tracker(cfg: dict):
     future extension but only ``"botsort"`` is wired up. A non-botsort value
     triggers a printed warning, then falls back to BoTSORT.
     """
-    if not BOXMOT_AVAILABLE:
-        raise RuntimeError("boxmot is not installed. pip install boxmot")
 
     requested = cfg.get("tracker_type", "botsort")
     if requested != "botsort":
@@ -51,8 +46,8 @@ def build_tracker(cfg: dict):
         )
 
     device = "cuda:0" if (torch is not None and torch.cuda.is_available()) else "cpu"
-    with_reid = bool(cfg.get("with_reid", True))
-    reid_weights = cfg.get("reid_weights", "osnet_x0_25_msmt17.pt") if with_reid else ""
+    with_reid = False #bool(cfg.get("with_reid", False))
+    reid_weights = None # cfg.get("reid_weights", "osnet_x0_25_msmt17.pt") if with_reid else ""
 
     return BotSort(
         reid_weights=reid_weights,
@@ -66,6 +61,7 @@ def build_tracker(cfg: dict):
         match_thresh=float(cfg.get("match_thresh", 0.8)),
         proximity_thresh=float(cfg.get("proximity_thresh", 0.5)),
         appearance_thresh=float(cfg.get("appearance_thresh", 0.25)),
+        supports_obb = True
     )
 
 

@@ -11,6 +11,7 @@ Exports:
 """
 
 import json
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,7 +32,6 @@ from ..utils import (
     OBBOX, FrameSource, VideoSource, ImageFolderSource,
     ensure_bgr_u8,
 )
-from ..workers import YOLO_MODEL_PATH
 
 
 class TrackingPage(QtWidgets.QWidget):
@@ -50,6 +50,10 @@ class TrackingPage(QtWidgets.QWidget):
         self.play_timer = QtCore.QTimer(self)
         self.play_timer.timeout.connect(self._on_play_tick)
         self.playing = False
+        self._play_fps = 25.0
+        self._play_anchor_time = 0.0
+        self._play_anchor_idx = 0
+        self._play_busy = False
 
         # ==================== Tracker state ====================
         self.tracker = None
@@ -360,20 +364,36 @@ class TrackingPage(QtWidgets.QWidget):
     def play(self):
         if not self.source or self.playing:
             return
-        fps = self.source.fps() or 25
-        self.play_timer.start(max(15, int(1000 / fps)))
+        self._play_fps = max(1.0, float(self.source.fps() or 25.0))
+        self._play_anchor_time = time.monotonic()
+        self._play_anchor_idx = self.current_idx
+        self._play_busy = False
         self.playing = True
+        self.canvas.set_fast_scaling(True)
+        self.play_timer.start(max(5, int(1000 / self._play_fps)))
 
     def pause(self):
         if self.playing:
             self.play_timer.stop()
             self.playing = False
+            self.canvas.set_fast_scaling(False)
+            self._redraw()
 
     def _on_play_tick(self):
-        if self.current_idx + 1 >= self.total_frames:
-            self.pause()
+        """Advance playback on wall-clock time, dropping late frames."""
+        if self._play_busy:
             return
-        self._read_frame(self.current_idx + 1)
+        self._play_busy = True
+        try:
+            elapsed = time.monotonic() - self._play_anchor_time
+            target = self._play_anchor_idx + int(elapsed * self._play_fps)
+            target = max(self.current_idx + 1, target)
+            if target >= self.total_frames:
+                self.pause()
+                return
+            self._read_frame(target)
+        finally:
+            self._play_busy = False
 
     # ==================== Zoom ====================
 
@@ -461,6 +481,52 @@ class TrackingPage(QtWidgets.QWidget):
         self.export_btn.setEnabled(ok)
         self.export_data_btn.setEnabled(ok)
 
+    def unload_project(self):
+        """Release the loaded clip and every tracker cache.
+
+        Tracks, trajectories and CMC snapshots are all tied to one clip inside
+        one project, so switching project must wipe them rather than let them
+        be exported into the new project's folder.
+        """
+        self.pause()
+        if self.source:
+            try:
+                self.source.close()
+            except Exception:
+                pass
+        self.source = None
+
+        self.total_frames = 0
+        self.current_idx = 0
+        self.current_frame_bgr = None
+
+        self.tracker = None
+        self.last_tracked_idx = -1
+        self.track_cache.clear()
+        self.traj_snapshots.clear()
+        self.cmc_cache.clear()
+        self._pending_id_changes.clear()
+
+        self.selected_idx = None
+        self.mode = "select"
+        self.dragging = False
+        self.drag_start_img = None
+        self.orig_poly = None
+        self.vertex_drag_idx = None
+
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setRange(0, 0)
+        self.frame_slider.setValue(0)
+        self.frame_slider.blockSignals(False)
+
+        self.canvas.set_frame(None)
+        self._update_step_btn()
+        self._update_export_btns()
+
+    def is_busy(self) -> bool:
+        """True while a tracking step or a video export is still running."""
+        return bool(self._tracking_running or self._exporting)
+
     def _reset_tracker(self):
         self.tracker = None
         self.last_tracked_idx = -1
@@ -518,7 +584,7 @@ class TrackingPage(QtWidgets.QWidget):
             source=self.source,
             start_idx=start, end_idx=end,
             tracker=self.tracker,
-            model_path=cfg.get("model_path", YOLO_MODEL_PATH),
+            model_path=cfg.get("model_path", ""),
             conf=float(self.conf_spin.value()),
             imgsz=int(cfg.get("imgsz", 1024)),
             frame_skip=self.frame_skip_spin.value(),
@@ -874,6 +940,9 @@ class TrackingPage(QtWidgets.QWidget):
         if event.button() != QtCore.Qt.MouseButton.LeftButton:
             return
 
+        # Dragging redraws on every move; keep resampling cheap until release.
+        self.canvas.set_fast_scaling(True)
+
         hit = self._pick_annot(xi, yi)
         if hit is None:
             self.selected_idx = None
@@ -913,7 +982,10 @@ class TrackingPage(QtWidgets.QWidget):
         self._redraw()
 
     def _on_canvas_mouse_release(self, event, xi: float, yi: float):
+        if not self.playing:
+            self.canvas.set_fast_scaling(False)
         if not self.dragging:
+            self._redraw()
             return
         self.dragging = False
         self.vertex_drag_idx = None

@@ -10,10 +10,10 @@ For each frame independently:
         cohesion_i = quantile_q( ||c_i - c_j|| for j != i ) / T
     where c_* are centroids and `q` is the quantile chosen with --quantile
     (default 0.25, i.e. the lower quartile of pairwise distances).
-  - cohesion_globale = mean of cohesion_i over present individuals.
+  - cohesion_global = mean of cohesion_i over present individuals.
 
 Output: one CSV with columns
-    frame, shark_<id>..., T, cohesion_globale
+    frame, shark_<id>..., T, cohesion_global
 
 Run `python scripts/cohesion.py --help` for all options.
 """
@@ -94,7 +94,7 @@ def compute_single_frame(frame: int, frame_index: dict, track_ids: list,
         for tid in track_ids:
             row[f"shark_{tid}"] = np.nan
         row["T"] = np.nan
-        row["cohesion_globale"] = np.nan
+        row["cohesion_global"] = np.nan
         return row
 
     # 3) T = median bbox diagonal in this frame
@@ -128,7 +128,7 @@ def compute_single_frame(frame: int, frame_index: dict, track_ids: list,
 
     # 6) Global cohesion = mean over present individuals
     row["T"] = round(T, 2)
-    row["cohesion_globale"] = (
+    row["cohesion_global"] = (
         round(float(np.mean(cohesion_values)), 4) if cohesion_values else np.nan
     )
     return row

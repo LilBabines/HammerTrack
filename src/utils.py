@@ -1,4 +1,4 @@
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 from dataclasses import dataclass
 
 import cv2
@@ -52,12 +52,21 @@ def cvimg_to_qimage(img_bgr: np.ndarray) -> QtGui.QImage:
 
 @dataclass
 class PolyClass:
-    """Annotation container for generic polygonal regions."""
-    poly: np.ndarray           # shape (n, 2) float32, image coordinates
+    """Annotation container for generic polygonal regions.
+
+    ``keypoints`` is only populated for the ``pose`` task, where ``poly`` holds
+    the (axis-aligned) bounding box and ``keypoints`` the N body points. It
+    stays ``None`` for the ``detect`` and ``obb`` tasks.
+    """
+    poly: np.ndarray                          # shape (n, 2) float32, image coords
     cls_id: int
     conf: float
     verified: bool = False
     deleted: bool = False
+    keypoints: Optional[np.ndarray] = None    # shape (N, 2) float32, image coords
+
+    def has_keypoints(self) -> bool:
+        return self.keypoints is not None and len(self.keypoints) > 0
 
     def to_json(self) -> dict:
         return {
@@ -66,6 +75,8 @@ class PolyClass:
             "conf": float(self.conf),
             "verified": bool(self.verified),
             "deleted": bool(self.deleted),
+            "keypoints": (self.keypoints.tolist()
+                          if self.has_keypoints() else None),
         }
 
 
@@ -114,6 +125,42 @@ def rect_to_poly_xyxy(x1: float, y1: float, x2: float, y2: float) -> np.ndarray:
                      [x1, y2]], dtype=np.float32)
 
 
+def keypoints_to_bbox_poly(
+    keypoints: np.ndarray,
+    margin_ratio: float = 0.12,
+    min_size: float = 4.0,
+    img_w: Optional[int] = None,
+    img_h: Optional[int] = None,
+) -> np.ndarray:
+    """Derive an axis-aligned box (as a 4-point polygon) from keypoints.
+
+    The tight keypoint extent is padded by ``margin_ratio`` of the larger side
+    so the box actually contains the animal rather than just its landmarks.
+    The result is clamped to the image when ``img_w`` / ``img_h`` are given.
+    """
+    pts = np.asarray(keypoints, dtype=np.float32).reshape(-1, 2)
+    x1, y1 = float(pts[:, 0].min()), float(pts[:, 1].min())
+    x2, y2 = float(pts[:, 0].max()), float(pts[:, 1].max())
+
+    margin = max(x2 - x1, y2 - y1) * margin_ratio
+    x1, y1, x2, y2 = x1 - margin, y1 - margin, x2 + margin, y2 + margin
+
+    # Guarantee a non-degenerate box (e.g. all keypoints on a straight line).
+    if x2 - x1 < min_size:
+        cx = (x1 + x2) / 2.0
+        x1, x2 = cx - min_size / 2.0, cx + min_size / 2.0
+    if y2 - y1 < min_size:
+        cy = (y1 + y2) / 2.0
+        y1, y2 = cy - min_size / 2.0, cy + min_size / 2.0
+
+    if img_w is not None:
+        x1, x2 = max(0.0, x1), min(float(img_w - 1), x2)
+    if img_h is not None:
+        y1, y2 = max(0.0, y1), min(float(img_h - 1), y2)
+
+    return rect_to_poly_xyxy(x1, y1, x2, y2)
+
+
 def find_orthogonal_projection(
     p1: np.ndarray,
     p2: np.ndarray,
@@ -160,8 +207,13 @@ def draw_annotations(
     selected_idx: Optional[int] = None,
     show_label: bool = False,
     show_conf: bool = False,
+    show_kpt_index: bool = True,
 ) -> np.ndarray:
-    """Draw verified / unverified / selected annotations on an image copy."""
+    """Draw verified / unverified / selected annotations on an image copy.
+
+    Pose instances additionally get their keypoints drawn, joined in index
+    order, with keypoint 0 highlighted so the ordering stays readable.
+    """
     out = img_bgr.copy()
     for i, b in enumerate(annots):
         if b.deleted or b.conf < conf_threshold:
@@ -183,6 +235,10 @@ def draw_annotations(
         # Draw polygon outline
         cv2.polylines(out, [pts], isClosed=True, color=color, thickness=thick)
 
+        # Keypoints (pose task only)
+        if b.has_keypoints():
+            draw_keypoints(out, b.keypoints, color, show_index=show_kpt_index)
+
         # Label only for unverified annotations (when requested)
         if not b.verified and (show_label or show_conf):
             parts = []
@@ -200,6 +256,44 @@ def draw_annotations(
                 cv2.putText(out, label, (x0 + 3, y0 + th + 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     return out
+
+
+def draw_keypoints(
+    img_bgr: np.ndarray,
+    keypoints: np.ndarray,
+    color: tuple = (0, 255, 255),
+    radius: int = 5,
+    show_index: bool = True,
+) -> np.ndarray:
+    """Draw keypoints in place, connected in index order.
+
+    Keypoint 0 is drawn larger and filled white so the start of the chain (and
+    therefore the left/right convention) is unambiguous while annotating.
+    """
+    pts = np.asarray(keypoints, dtype=np.float32).reshape(-1, 2)
+    if len(pts) == 0:
+        return img_bgr
+
+    int_pts = pts.astype(int)
+
+    # Skeleton: simple chain following the keypoint order.
+    for i in range(1, len(int_pts)):
+        cv2.line(img_bgr, tuple(int_pts[i - 1]), tuple(int_pts[i]),
+                 color, 2, cv2.LINE_AA)
+
+    for i, (x, y) in enumerate(int_pts):
+        if i == 0:
+            cv2.circle(img_bgr, (x, y), radius + 2, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(img_bgr, (x, y), radius + 2, color, 2, cv2.LINE_AA)
+        else:
+            cv2.circle(img_bgr, (x, y), radius, color, -1, cv2.LINE_AA)
+            cv2.circle(img_bgr, (x, y), radius, (20, 20, 20), 1, cv2.LINE_AA)
+
+        if show_index:
+            cv2.putText(img_bgr, str(i), (x + radius + 2, y - radius),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
+                        cv2.LINE_AA)
+    return img_bgr
 
 
 
@@ -221,6 +315,22 @@ class FrameSource:
 
 
 class VideoSource(FrameSource):
+    """Random-access video reader that stays fast when read sequentially.
+
+    Seeking with ``CAP_PROP_POS_FRAMES`` forces the decoder to restart from
+    the previous keyframe, so on inter-coded video (H.264/H.265) asking for
+    frame *n+1* that way costs a whole GOP instead of a single frame. The
+    reader therefore tracks its own position and only seeks when it really
+    has to:
+
+    * next frame           → plain ``read()``            (cheapest)
+    * small forward jump   → ``grab()`` the gap, decode only the last one
+    * backward or far jump → real seek
+    """
+
+    #: Above this forward gap, seeking beats decoding frame by frame.
+    MAX_GRAB_SKIP = 24
+
     def __init__(self, path: str):
         self.path = path
         self.cap = cv2.VideoCapture(path)
@@ -228,14 +338,33 @@ class VideoSource(FrameSource):
             raise RuntimeError(f"Cannot open video: {path}")
         self._count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         self._fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        # Index the capture will return on the next plain read().
+        self._pos = 0
 
     def count(self) -> int: return self._count
 
     def read(self, idx: int) -> Optional[np.ndarray]:
         idx = max(0, min(idx, self._count - 1))
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+
+        if idx != self._pos:
+            gap = idx - self._pos
+            if 0 < gap <= self.MAX_GRAB_SKIP:
+                # grab() decodes without building a numpy array: far cheaper
+                # than a seek, and cheaper than a full read per skipped frame.
+                for _ in range(gap):
+                    if not self.cap.grab():
+                        break
+            else:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            self._pos = idx
+
         ok, frame = self.cap.read()
-        return frame if ok else None
+        if not ok:
+            # Force a real seek next time: the position is now unknown.
+            self._pos = -1
+            return None
+        self._pos = idx + 1
+        return frame
 
     def fps(self) -> float: return self._fps
     def close(self):
