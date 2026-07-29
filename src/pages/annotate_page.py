@@ -781,6 +781,9 @@ class AnnotatePage(QtWidgets.QWidget):
             ),
             source_path=source_path,
             task=self._effective_task(),
+            two_stage=bool(cfg.get("two_stage", False)),
+            region_conf=float(cfg.get("region_conf", 0.10)),
+            max_regions=int(cfg.get("max_regions", 8)),
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
@@ -863,6 +866,12 @@ class AnnotatePage(QtWidgets.QWidget):
             ),
             source_path=None,
             task=self._effective_task(),
+            # Never two-stage here, whatever the project setting says: the user
+            # has already framed the region by hand. A proposal pass would spend
+            # a forward pass rediscovering a region that was just handed to it,
+            # then crop *inside* it — losing part of the area deliberately
+            # selected, and re-detecting at a scale the user did not ask for.
+            two_stage=False,
         )
         self._crop_worker.moveToThread(self._crop_thread)
         self._crop_thread.started.connect(self._crop_worker.run)

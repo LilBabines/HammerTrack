@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 
 from ..tasks import TASK_OBB, normalize_task
-from ..utils import OBBOX
+from ..utils import OBBOX, draw_keypoints
 
 try:
     import torch
@@ -279,6 +279,16 @@ def iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return inter / np.maximum(aa[:, None] + ab[None, :] - inter, 1e-6)
 
 
+# ==================== Duplicate suppression ====================
+# Moved to ``utils`` now that the annotation pipeline needs it too: it is pure
+# geometry over OBBOX and must not live in the tracking sub-package. Re-exported
+# here so existing imports keep working.
+
+from ..utils import (                                          # noqa: E402
+    KPT_SAME_RATIO, suppress_duplicate_detections,
+)
+
+
 # ==================== STrack patching ====================
 
 def update_strack_bbox(strack, x1: float, y1: float, x2: float, y2: float):
@@ -389,8 +399,19 @@ def draw_tracked_annotations(
     show_trails: bool = True,
     color_of: Optional[Callable[[int], Optional[Tuple[int, int, int]]]] = None,
     label_of: Optional[Callable[[int], Optional[str]]] = None,
+    show_keypoints: bool = True,
+    show_kpt_index: bool = False,
 ) -> np.ndarray:
-    """Render OBBs + (optionally) per-ID trails onto a copy of ``img_bgr``.
+    """Render OBBs, pose keypoints and (optionally) per-ID trails.
+
+    Keypoints are drawn in the *same* colour as their box, which is the whole
+    point of routing them through ``resolve``: every fragment of one animal —
+    box, trail and landmarks — carries that animal's colour, so a mis-grouped
+    fragment is visible at a glance.
+
+    Indices are off by default here, unlike the annotation canvas: a tracking
+    frame already carries an ID label per box, and numbering five landmarks on
+    top of that turns a school of sharks into unreadable clutter.
 
     ``color_of`` and ``label_of`` let the identity layer take over: pass
     ``IndividualStore.color_for_track`` and every fragment of one animal is
@@ -442,6 +463,11 @@ def draw_tracked_annotations(
             color, thick = resolve(tid), 4
 
         cv2.polylines(out, [pts], True, color, thick, cv2.LINE_AA)
+
+        # Pose landmarks, when the detector produced any. BoxMOT never sees
+        # them, so they are simply whatever the detector attached to this box.
+        if show_keypoints and b.has_keypoints():
+            draw_keypoints(out, b.keypoints, color, show_index=show_kpt_index)
 
         label = f"ID:{tid}" if tid >= 0 else "?"
         if label_of is not None and tid >= 0:

@@ -4,6 +4,7 @@ import io
 from typing import List, Optional
 import time
 
+import cv2
 import numpy as np
 from PySide6 import QtCore
 
@@ -18,13 +19,16 @@ from .tasks import (
     TASK_DETECT, TASK_POSE,
     default_model_for, is_pretrained_name, normalize_task, validate_pretrained,
 )
-from .utils import OBBOX, rect_to_poly_xyxy
-
+from .utils import (
+    OBBOX, ensure_bgr_u8, parse_pose_result, rect_to_poly_xyxy,
+    translate_annotation, two_stage_detect,
+)
 
 _RESERVED_TRAIN_ARGS = frozenset({
         "data", "epochs", "imgsz", "batch", "project", "name",
         "exist_ok", "verbose", "seed", "task", "model", "resume",
     })
+
 
 def resolve_model_path(model_path: str, task: str = TASK_DETECT) -> str:
     """Return usable inference weights for ``task``.
@@ -77,16 +81,19 @@ class _StdoutCapture(io.TextIOBase):
 
 
 # ---------------------------------------------------------------------------
-# Detection (YOLO-OBB)
+# Detection (YOLO detect / obb / pose)
 # ---------------------------------------------------------------------------
 class DetectionWorker(QtCore.QObject):
-    """Run oriented-bounding-box detection on a single frame using YOLO-OBB.
+    """Run detection on a single frame using YOLO.
 
     Accepts EITHER:
       - source_path (str): path to an image file → passed directly to YOLO
       - frame_bgr (np.ndarray): BGR uint8 array (e.g. from video capture)
 
-    When source_path is given, it takes priority (YOLO handles its own I/O).
+    In single-pass mode ``source_path`` takes priority, since YOLO then handles
+    its own I/O and decoding. In two-stage mode a numpy array is required —
+    regions have to be cropped out of actual pixels — so a path-only source is
+    read here instead.
     """
     finished = QtCore.Signal(object, object, object)
     error = QtCore.Signal(str)
@@ -100,6 +107,9 @@ class DetectionWorker(QtCore.QObject):
         model_path: str = "",
         source_path: str = None,
         task: str = TASK_DETECT,
+        two_stage: bool = False,
+        region_conf: float = 0.10,
+        max_regions: int = 8,
     ):
         super().__init__()
         self.frame_idx = frame_idx
@@ -109,6 +119,9 @@ class DetectionWorker(QtCore.QObject):
         self.imgsz = imgsz
         self.source_path = source_path
         self.task = normalize_task(task)
+        self.two_stage = bool(two_stage)
+        self.region_conf = float(region_conf)
+        self.max_regions = int(max_regions)
 
     @classmethod
     def clear_model_cache(cls):
@@ -133,141 +146,181 @@ class DetectionWorker(QtCore.QObject):
             print(f"[DetectionWorker] Model task: {cls._model_task}")
         return cls._model
 
-    @staticmethod
-    def _parse_pose(res) -> List[OBBOX]:
-        """Build annotations from a pose result: box + (K, 2) keypoints.
+    # ------------------------------------------------------------------
+    # Result → annotations
+    # ------------------------------------------------------------------
 
-        ``res.keypoints`` may be absent when the model is not a pose model, in
-        which case the boxes are still returned without keypoints rather than
-        dropping the detections entirely.
+    def _extract(self, res) -> List[OBBOX]:
+        """Annotations from one ultralytics result, whatever the task.
+
+        Pulled out of ``run()`` because the two-stage path runs it once per
+        region as well as once on the whole frame. A single entry point also
+        guarantees the proposal pass and the refinement pass read a result the
+        same way.
         """
-        out: List[OBBOX] = []
-        xyxy = res.boxes.xyxy.cpu().numpy()
-        cls_ids = res.boxes.cls.cpu().numpy()
-        confs = res.boxes.conf.cpu().numpy()
+        has_obb = (
+            hasattr(res, "obb")
+            and res.obb is not None
+            and len(res.obb) > 0
+        )
+        has_boxes = res.boxes is not None and len(res.boxes) > 0
 
-        kpts = None
-        kp_obj = getattr(res, "keypoints", None)
-        if kp_obj is not None and getattr(kp_obj, "xy", None) is not None:
-            arr = kp_obj.xy
-            kpts = arr.cpu().numpy() if hasattr(arr, "cpu") else np.asarray(arr)
+        # --- Pose path: axis-aligned box + keypoints ---
+        if self.task == TASK_POSE and has_boxes:
+            # Shared with the tracking worker, so both apply the identical
+            # "all points at the origin means no keypoints" guard.
+            return parse_pose_result(res)
 
-        for i, ((x1, y1, x2, y2), c, sc) in enumerate(zip(xyxy, cls_ids, confs)):
-            kp = None
-            if kpts is not None and i < len(kpts):
-                candidate = np.asarray(kpts[i], dtype=np.float32).reshape(-1, 2)
-                # A model that found no keypoints reports them all at the
-                # origin; keeping those would poison the annotations.
-                if len(candidate) and not np.allclose(candidate, 0.0):
-                    kp = candidate
-            out.append(OBBOX(
+        if has_obb:
+            return self._extract_obb(res.obb)
+
+        # --- AABB fallback ---
+        if has_boxes:
+            return self._extract_aabb(res.boxes)
+
+        return []
+
+    @staticmethod
+    def _extract_obb(obb) -> List[OBBOX]:
+        """Oriented boxes, from the 4-point form or the xywhr fallback."""
+        boxes: List[OBBOX] = []
+        polys = getattr(obb, "xyxyxyxy", None)
+        cls = getattr(obb, "cls", None)
+        conf_vals = getattr(obb, "conf", None)
+
+        if polys is not None and len(polys) > 0:
+            P = (polys.cpu().numpy() if hasattr(polys, "cpu")
+                 else np.asarray(polys))
+            C = (cls.cpu().numpy() if hasattr(cls, "cpu")
+                 else np.zeros(len(P)))
+            S = (conf_vals.cpu().numpy() if hasattr(conf_vals, "cpu")
+                 else np.ones(len(P)))
+            for p, c, s in zip(P, C, S):
+                boxes.append(OBBOX(
+                    poly=p.reshape(4, 2).astype(np.float32),
+                    cls_id=int(c), conf=float(s),
+                ))
+            return boxes
+
+        xywhr = getattr(obb, "xywhr", None)
+        if xywhr is None or len(xywhr) == 0:
+            return boxes
+
+        X = (xywhr.cpu().numpy() if hasattr(xywhr, "cpu")
+             else np.asarray(xywhr))
+        C = (cls.cpu().numpy() if hasattr(cls, "cpu") else np.zeros(len(X)))
+        S = (conf_vals.cpu().numpy() if hasattr(conf_vals, "cpu")
+             else np.ones(len(X)))
+        for (cx, cy, w, h, rad), c, s in zip(X, C, S):
+            rect = np.array(
+                [[-w / 2, -h / 2], [w / 2, -h / 2],
+                 [w / 2, h / 2], [-w / 2, h / 2]],
+                dtype=np.float32,
+            )
+            cos_r, sin_r = np.cos(rad), np.sin(rad)
+            R = np.array([[cos_r, -sin_r], [sin_r, cos_r]], dtype=np.float32)
+            pts = rect @ R.T + np.array([cx, cy], dtype=np.float32)
+            boxes.append(OBBOX(poly=pts, cls_id=int(c), conf=float(s)))
+        return boxes
+
+    @staticmethod
+    def _extract_aabb(res_boxes) -> List[OBBOX]:
+        """Axis-aligned boxes: detect task, or a pose model with no keypoints."""
+        boxes: List[OBBOX] = []
+        xyxy = res_boxes.xyxy.cpu().numpy()
+        C = res_boxes.cls.cpu().numpy()
+        S = res_boxes.conf.cpu().numpy()
+        for (x1, y1, x2, y2), c, s in zip(xyxy, C, S):
+            boxes.append(OBBOX(
                 poly=rect_to_poly_xyxy(x1, y1, x2, y2),
-                cls_id=int(c), conf=float(sc), keypoints=kp,
+                cls_id=int(c), conf=float(s),
             ))
-        return out
+        return boxes
+
+    # ------------------------------------------------------------------
+    # Sources
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _as_u8(img: np.ndarray) -> np.ndarray:
+        """Minimal dtype guard. YOLO wants uint8 BGR — no RGB swap here."""
+        if img.dtype == np.uint8:
+            return img
+        if img.dtype == np.uint16:
+            return (img / 256).astype(np.uint8)
+        return img.astype(np.uint8)
+
+    def _resolve_source(self):
+        """Single-pass source: the file path when available, else the array."""
+        if self.source_path and os.path.isfile(self.source_path):
+            return self.source_path
+        if self.frame_bgr is not None:
+            return self._as_u8(self.frame_bgr)
+        raise RuntimeError("No source_path and no frame_bgr provided.")
+
+    def _resolve_frame(self) -> np.ndarray:
+        """Two-stage source: always an array, since regions must be cropped.
+
+        Letting YOLO read the file itself is cheaper, but then there are no
+        pixels here to cut the regions out of — so a path-only source is decoded
+        and normalised at this point instead.
+        """
+        if self.frame_bgr is not None:
+            return self._as_u8(self.frame_bgr)
+        if self.source_path and os.path.isfile(self.source_path):
+            img = cv2.imread(self.source_path, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise RuntimeError(f"Cannot read image: {self.source_path}")
+            return ensure_bgr_u8(img)
+        raise RuntimeError("No source_path and no frame_bgr provided.")
+
+    def _predict(self, model, image: np.ndarray, conf: float) -> List[OBBOX]:
+        res = model.predict(
+            source=image, imgsz=self.imgsz, conf=conf, verbose=False,
+        )
+        return self._extract(res[0])
+
+    # ------------------------------------------------------------------
 
     @QtCore.Slot()
     def run(self):
         try:
             model = self._get_model(self.model_path)
-
-            # --- Choose source: file path preferred, numpy fallback ---
-            if self.source_path and os.path.isfile(self.source_path):
-                source = self.source_path
-            elif self.frame_bgr is not None:
-                # YOLO expects RGB uint8 when given a numpy array
-                bgr = self.frame_bgr
-                # Safety: ensure uint8 (basic conversion only)
-                if bgr.dtype != np.uint8:
-                    if bgr.dtype == np.uint16:
-                        bgr = (bgr / 256).astype(np.uint8)
-                    else:
-                        bgr = bgr.astype(np.uint8)
-                # YOLO's internal pipeline expects BGR (it does its own conversion)
-                # Passing BGR directly — do NOT convert to RGB here
-                source = bgr
-            else:
-                raise RuntimeError("No source_path and no frame_bgr provided.")
-
-            # --- Predict ---
-            results = model.predict(
-                source=source,
-                imgsz=self.imgsz,
-                conf=self.conf,
-                verbose=False,
-            )
-            res = results[0]
             names = getattr(model, "names", None)
 
-            has_obb = (
-                hasattr(res, "obb")
-                and res.obb is not None
-                and len(res.obb) > 0
-            )
-            has_boxes = res.boxes is not None and len(res.boxes) > 0
-
-            boxes: List[OBBOX] = []
-
-            # --- Pose path: axis-aligned box + keypoints ---
-            if self.task == TASK_POSE and has_boxes:
-                boxes = self._parse_pose(res)
-
-            # --- OBB path ---
-            elif has_obb:
-                obb = res.obb
-                polys = getattr(obb, "xyxyxyxy", None)
-                cls = getattr(obb, "cls", None)
-                conf_vals = getattr(obb, "conf", None)
-
-                if polys is not None and len(polys) > 0:
-                    P = (polys.cpu().numpy() if hasattr(polys, "cpu")
-                         else np.asarray(polys))
-                    C = (cls.cpu().numpy() if hasattr(cls, "cpu")
-                         else np.zeros(len(P)))
-                    S = (conf_vals.cpu().numpy() if hasattr(conf_vals, "cpu")
-                         else np.ones(len(P)))
-                    for p, c, s in zip(P, C, S):
-                        boxes.append(OBBOX(
-                            poly=p.reshape(4, 2).astype(np.float32),
-                            cls_id=int(c), conf=float(s),
-                        ))
-                else:
-                    xywhr = getattr(obb, "xywhr", None)
-                    if xywhr is not None and len(xywhr) > 0:
-                        X = (xywhr.cpu().numpy() if hasattr(xywhr, "cpu")
-                             else np.asarray(xywhr))
-                        C = (cls.cpu().numpy() if hasattr(cls, "cpu")
-                             else np.zeros(len(X)))
-                        S = (conf_vals.cpu().numpy()
-                             if hasattr(conf_vals, "cpu") else np.ones(len(X)))
-                        for (cx, cy, w, h, rad), c, s in zip(X, C, S):
-                            rect = np.array(
-                                [[-w / 2, -h / 2], [w / 2, -h / 2],
-                                 [w / 2, h / 2], [-w / 2, h / 2]],
-                                dtype=np.float32,
-                            )
-                            cos_r, sin_r = np.cos(rad), np.sin(rad)
-                            R = np.array(
-                                [[cos_r, -sin_r], [sin_r, cos_r]],
-                                dtype=np.float32,
-                            )
-                            pts = rect @ R.T + np.array(
-                                [cx, cy], dtype=np.float32
-                            )
-                            boxes.append(OBBOX(
-                                poly=pts, cls_id=int(c), conf=float(s),
-                            ))
-
-            # --- AABB fallback ---
-            elif has_boxes:
-                xyxy = res.boxes.xyxy.cpu().numpy()
-                C = res.boxes.cls.cpu().numpy()
-                S = res.boxes.conf.cpu().numpy()
-                for (x1, y1, x2, y2), c, s in zip(xyxy, C, S):
-                    boxes.append(OBBOX(
-                        poly=rect_to_poly_xyxy(x1, y1, x2, y2),
-                        cls_id=int(c), conf=float(s),
-                    ))
+            if self.two_stage:
+                frame = self._resolve_frame()
+                boxes, stats = two_stage_detect(
+                    frame,
+                    # Permissive: the first pass only has to notice something
+                    # is there, and its boxes are proposals, not results.
+                    predict_frame=lambda img: self._predict(
+                        model, img, self.region_conf),
+                    # The refinement pass uses the real threshold.
+                    predict_region=lambda img: self._predict(
+                        model, img, self.conf),
+                    imgsz=self.imgsz,
+                    max_regions=self.max_regions,
+                    keep_conf=self.conf,
+                    translate=translate_annotation,
+                )
+                print(
+                    f"[DetectionWorker] two-stage frame {self.frame_idx}: "
+                    f"{stats['regions']} region(s), pass1={stats['pass1']} "
+                    f"pass2={stats['pass2']}, "
+                    f"{stats['kept_pass1']} kept unrefined, "
+                    f"{stats['below_conf']} below conf, "
+                    f"{stats['edge_dropped']} edge-clipped, "
+                    f"{stats['suppressed']} duplicate(s) removed"
+                )
+            else:
+                res = model.predict(
+                    source=self._resolve_source(),
+                    imgsz=self.imgsz,
+                    conf=self.conf,
+                    verbose=False,
+                )[0]
+                boxes = self._extract(res)
 
             print(f"[DetectionWorker] Emitting {len(boxes)} boxes")
             self.finished.emit(self.frame_idx, names, boxes)
@@ -283,7 +336,7 @@ class DetectionWorker(QtCore.QObject):
 # ---------------------------------------------------------------------------
 
 class DetectFinetuneWorker(QtCore.QObject):
-    """Build a YOLO-OBB dataset from verified polygons and fine-tune the model.
+    """Build a YOLO dataset from verified polygons and fine-tune the model.
 
     Signals:
         progress(str, float)          — message + progress in [0, 1]
@@ -373,7 +426,8 @@ class DetectFinetuneWorker(QtCore.QObject):
 
             # Bare official names are downloaded by ultralytics on first use.
             self.log_line.emit(
-                f"=== Base model: {self.base_model} (pretrained, task={self.task}) ==="
+                f"=== Base model: {self.base_model} "
+                f"(pretrained, task={self.task}) ==="
             )
             model = YOLO(self.base_model)
 
@@ -398,12 +452,14 @@ class DetectFinetuneWorker(QtCore.QObject):
                     except (TypeError, ValueError):
                         continue
 
-                # tloss = moyenne sur l'epoch (loss_items = dernier batch seulement)
+                # tloss = epoch mean; loss_items is the last batch only.
                 tloss = getattr(trainer, "tloss", None)
                 if tloss is not None:
                     try:
-                        items = trainer.label_loss_items(tloss)   # dict {'train/box_loss': float, ...}
-                        if isinstance(items, dict):               # None → renvoie une liste de noms
+                        # dict {'train/box_loss': float, ...}, but a list of
+                        # names when tloss is None — hence the isinstance guard.
+                        items = trainer.label_loss_items(tloss)
+                        if isinstance(items, dict):
                             for k, v in items.items():
                                 try:
                                     metrics[str(k)] = float(v)
@@ -412,7 +468,9 @@ class DetectFinetuneWorker(QtCore.QObject):
                     except Exception:
                         pass
 
-                worker_ref.progress.emit(f"Epoch {epoch}/{total_epochs}", epoch / total_epochs)
+                worker_ref.progress.emit(
+                    f"Epoch {epoch}/{total_epochs}", epoch / total_epochs
+                )
                 worker_ref.epoch_metrics.emit(epoch, total_epochs, metrics)
 
             model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
@@ -455,7 +513,7 @@ class DetectFinetuneWorker(QtCore.QObject):
                 exist_ok=True,
                 verbose=True,
                 seed=self.seed,
-                **safe,          # ← remplace flipud=0.5, fliplr=0.5 en dur
+                **safe,
             )
 
             # Locate best weights

@@ -1,10 +1,11 @@
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Sequence, Tuple
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
 from PySide6 import QtGui
 
+import copy
 import warnings
 import os
 
@@ -227,6 +228,71 @@ def parse_yolo_label_line(
                  verified=True, keypoints=keypoints)
 
 
+def parse_pose_result(res) -> List["OBBOX"]:
+    """Build annotations from an ultralytics pose result: box + (K, 2) points.
+
+    Shared by the annotation worker and the tracking worker on purpose. Both
+    have to apply the same "all keypoints at the origin means none" guard, and
+    a duplicated copy of that rule would eventually drift — leaving one of the
+    two pipelines silently recording (0, 0) landmarks.
+
+    ``res.keypoints`` may be absent when the loaded model is not a pose model,
+    in which case the boxes are still returned, without keypoints, rather than
+    dropping the detections entirely. Row *i* of ``keypoints`` corresponds to
+    row *i* of ``boxes``, which is what makes the zip below valid.
+    """
+    out: List["OBBOX"] = []
+    if res.boxes is None or len(res.boxes) == 0:
+        return out
+
+    xyxy = res.boxes.xyxy.cpu().numpy()
+    cls_ids = res.boxes.cls.cpu().numpy()
+    confs = res.boxes.conf.cpu().numpy()
+
+    kpts = None
+    kp_obj = getattr(res, "keypoints", None)
+    if kp_obj is not None and getattr(kp_obj, "xy", None) is not None:
+        arr = kp_obj.xy
+        kpts = arr.cpu().numpy() if hasattr(arr, "cpu") else np.asarray(arr)
+
+    for i, ((x1, y1, x2, y2), c, sc) in enumerate(zip(xyxy, cls_ids, confs)):
+        kp = None
+        if kpts is not None and i < len(kpts):
+            candidate = np.asarray(kpts[i], dtype=np.float32).reshape(-1, 2)
+            # A model that found no keypoints reports them all at the origin;
+            # keeping those would poison annotations and exports alike.
+            if len(candidate) and not np.allclose(candidate, 0.0):
+                kp = candidate
+        out.append(OBBOX(
+            poly=rect_to_poly_xyxy(x1, y1, x2, y2),
+            cls_id=int(c), conf=float(sc), keypoints=kp,
+        ))
+    return out
+
+
+def keypoints_to_named_dict(
+    keypoints: Optional[np.ndarray],
+    names: Optional[List[str]] = None,
+    ndigits: int = 2,
+) -> Optional[Dict[str, List[float]]]:
+    """``{name: [x, y]}`` for export, or None when there are no keypoints.
+
+    Returning None rather than an empty dict is deliberate: a frame where the
+    tracker coasted has no landmarks at all, and ``null`` says that, whereas
+    ``{}`` reads like "a pose with zero points".
+    """
+    if keypoints is None or len(keypoints) == 0:
+        return None
+    pts = np.asarray(keypoints, dtype=np.float32).reshape(-1, 2)
+    labels = list(names or [])
+    if len(labels) < len(pts):
+        labels += [f"kpt_{i}" for i in range(len(labels), len(pts))]
+    return {
+        labels[i]: [round(float(x), ndigits), round(float(y), ndigits)]
+        for i, (x, y) in enumerate(pts)
+    }
+
+
 def find_orthogonal_projection(
     p1: np.ndarray,
     p2: np.ndarray,
@@ -259,6 +325,372 @@ def find_orthogonal_projection(
     proj_p2 = p1 + d + ortho  # = p2 + ortho
 
     return np.array([proj_p2, proj_p1], dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Duplicate suppression
+# ---------------------------------------------------------------------------
+
+
+#: Two pose detections whose skeletons sit closer than this fraction of the
+#: animal's diagonal are the same animal seen twice, whatever their boxes say.
+#: This is an *extra* suppression trigger, never a veto: it catches the
+#: duplicate that IoU misses (two boxes of very different sizes on one shark)
+#: without ever endangering a genuine neighbour, whose skeleton is nowhere near.
+KPT_SAME_RATIO = 0.10
+
+
+def _aabb(poly: np.ndarray) -> np.ndarray:
+    pts = poly.reshape(-1, 2)
+    return np.array([pts[:, 0].min(), pts[:, 1].min(),
+                     pts[:, 0].max(), pts[:, 1].max()], dtype=np.float32)
+
+
+def _pair_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    """IoU of two AABBs ``[x1, y1, x2, y2]``."""
+    x1 = max(float(box_a[0]), float(box_b[0]))
+    y1 = max(float(box_a[1]), float(box_b[1]))
+    x2 = min(float(box_a[2]), float(box_b[2]))
+    y2 = min(float(box_a[3]), float(box_b[3]))
+    inter = max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(float(box_a[2] - box_a[0]) * float(box_a[3] - box_a[1]), 1e-6)
+    area_b = max(float(box_b[2] - box_b[0]) * float(box_b[3] - box_b[1]), 1e-6)
+    return float(inter / max(area_a + area_b - inter, 1e-6))
+
+
+def _skeletons_coincide(a: OBBOX, b: OBBOX) -> bool:
+    """Whether two pose detections describe the same animal.
+
+    The mean landmark distance is normalised by the **larger** of the two box
+    diagonals, which makes the test symmetric: normalising by the candidate's
+    own box would make the answer depend on which detection is compared to
+    which, so a part-detection nested in a whole-animal one would be judged
+    differently depending on iteration order.
+    """
+    if not (a.has_keypoints() and b.has_keypoints()):
+        return False
+    pa = np.asarray(a.keypoints, dtype=np.float32).reshape(-1, 2)
+    pb = np.asarray(b.keypoints, dtype=np.float32).reshape(-1, 2)
+    if len(pa) != len(pb) or len(pa) == 0:
+        return False
+
+    box_a, box_b = _aabb(a.poly), _aabb(b.poly)
+    diag = max(float(np.hypot(box_a[2] - box_a[0], box_a[3] - box_a[1])),
+               float(np.hypot(box_b[2] - box_b[0], box_b[3] - box_b[1])))
+    if diag < 1e-6:
+        return False
+    mean_dist = float(np.linalg.norm(pa - pb, axis=1).mean())
+    return mean_dist / diag <= KPT_SAME_RATIO
+
+
+def suppress_duplicate_detections(
+    boxes: List[OBBOX], threshold: float,
+) -> Tuple[List[OBBOX], int]:
+    """Greedy NMS over detections, run *before* the tracker sees them.
+
+    Ultralytics already NMS-es internally, but its default ``iou=0.7`` is
+    permissive for an elongated animal: two boxes offset along a shark's axis
+    can both survive, each then claims its own track ID, and the same animal
+    ends up with several IDs, several skeletons and several trails. Nothing
+    downstream can undo that, because by then the identities are genuinely
+    distinct — hence suppressing here, where the tracker and the frame cache
+    are handed the same list, so display, tracking and export are all fixed at
+    once.
+
+    A detection is dropped when it either overlaps a kept one above
+    ``threshold`` (plain IoU, the usual meaning of an NMS threshold) or shares
+    its skeleton with it (see :data:`KPT_SAME_RATIO`).
+
+    Containment — intersection over the *smaller* area — is deliberately NOT
+    used. It would catch a head-only detection nested in a whole-animal one,
+    but it also scores 1.0 for a small shark passing under a large one, and
+    deleting a real animal from a school is a far worse failure than leaving a
+    spurious box that a higher ``conf`` would remove anyway.
+
+    ``threshold <= 0`` disables the pass. Returns ``(kept, n_removed)``.
+    """
+    if threshold <= 0.0 or len(boxes) < 2:
+        return boxes, 0
+
+    # Highest confidence first, so a duplicate never displaces the better
+    # detection of the same animal.
+    order = sorted(range(len(boxes)),
+                   key=lambda i: float(boxes[i].conf), reverse=True)
+    aabbs = {i: _aabb(boxes[i].poly) for i in order}
+
+    kept: List[int] = []
+    for i in order:
+        if any(_pair_iou(aabbs[i], aabbs[j]) >= threshold
+               or _skeletons_coincide(boxes[i], boxes[j])
+               for j in kept):
+            continue
+        kept.append(i)
+
+    kept.sort()          # restore detection order for stable downstream indexing
+    return [boxes[i] for i in kept], len(boxes) - len(kept)
+
+
+# ---------------------------------------------------------------------------
+# Two-stage detection (region proposal, then native-resolution refinement)
+# ---------------------------------------------------------------------------
+
+#: Padding added around every proposed box before grouping, in pixels. A box
+#: from the low-resolution pass clips thin extremities — a shark's tail is the
+#: first thing to fall outside it — and the second pass must see them.
+REGION_PADDING = 12
+
+#: A second-pass detection whose box comes closer than this to a region border
+#: is dropped, unless that border is the image border. It is an animal cut by
+#: the crop: its box is truncated and its keypoints are guesswork, yet its
+#: confidence can beat the correct detection from a neighbouring region.
+REGION_EDGE_MARGIN = 4
+
+#: IoU above which a first-pass detection counts as "found again" by the
+#: second pass, and is therefore dropped in favour of the refined version.
+REGION_COVERED_IOU = 0.35
+
+
+def translate_annotation(box: "PolyClass", dx: float, dy: float) -> "PolyClass":
+    """Copy of ``box`` moved by ``(dx, dy)``, polygon **and** keypoints.
+
+    Canonical implementation, so crop space → frame space is written once. Every
+    hand-rolled version of this shift so far has moved the polygon and left the
+    keypoints behind, which parks every skeleton at the top-left of the frame.
+    """
+    out = copy.copy(box)
+    off = np.array([dx, dy], dtype=np.float32)
+    out.poly = box.poly.reshape(-1, 2).astype(np.float32) + off
+    if box.has_keypoints():
+        out.keypoints = box.keypoints.reshape(-1, 2).astype(np.float32) + off
+    return out
+
+
+def merge_overlapping_boxes(boxes: Sequence[np.ndarray]) -> List[np.ndarray]:
+    """Replace every group of touching AABBs by its union, transitively.
+
+    Mirrors TRex's ``merge_boxes(..., iou_threshold=0.0)``: any two boxes that
+    overlap at all become one region. Splitting an animal across two crops
+    would give two truncated detections instead of one good one, and running
+    two nearly identical crops wastes a forward pass for nothing.
+    """
+    remaining = [np.asarray(b, dtype=np.float32).copy() for b in boxes]
+    merged: List[np.ndarray] = []
+    while remaining:
+        current = remaining.pop(0)
+        changed = True
+        while changed:
+            changed = False
+            rest = []
+            for other in remaining:
+                overlap = (current[0] < other[2] and other[0] < current[2]
+                           and current[1] < other[3] and other[1] < current[3])
+                if overlap:
+                    current = np.array([
+                        min(current[0], other[0]), min(current[1], other[1]),
+                        max(current[2], other[2]), max(current[3], other[3]),
+                    ], dtype=np.float32)
+                    changed = True
+                else:
+                    rest.append(other)
+            remaining = rest
+        merged.append(current)
+    return merged
+
+
+def region_windows(
+    boxes: Sequence[np.ndarray],
+    img_w: int,
+    img_h: int,
+    imgsz: int,
+    padding: int = REGION_PADDING,
+    max_regions: int = 8,
+) -> List[Tuple[int, int, int, int]]:
+    """Square crop windows for the second pass, as ``(x0, y0, w, h)``.
+
+    Each window is **at least ``imgsz`` wide**, so the model sees native pixels
+    rather than an interpolated blow-up. That is the whole point: a shark 140 px
+    long in a 3840-wide frame arrives at the network 37 px long once the frame
+    is letterboxed to 1024, and its tail is under 3 px. In a 1024 window the
+    same shark arrives 140 px long — and, crucially, at a scale the model has
+    actually been trained on, since the multi-scale export never upscales
+    either. Cropping tighter and letting the resize enlarge the animal would
+    look sharper while putting it outside the training distribution.
+
+    Boxes are grouped so that as many animals as possible share one window: two
+    sharks 200 px apart would otherwise get two windows overlapping by 80%, for
+    two forward passes and one duplicate detection. A group only grows while it
+    still fits in ``imgsz``, so grouping never costs resolution.
+    """
+    if imgsz <= 0 or not len(boxes):
+        return []
+
+    padded = []
+    for box in boxes:
+        b = np.asarray(box, dtype=np.float32).reshape(4)
+        padded.append(np.array([
+            max(0.0, b[0] - padding), max(0.0, b[1] - padding),
+            min(float(img_w), b[2] + padding),
+            min(float(img_h), b[3] + padding),
+        ], dtype=np.float32))
+
+    regions = merge_overlapping_boxes(padded)
+    # Biggest first: a group that already exceeds imgsz cannot absorb anything
+    # without costing scale, so it should not steal small neighbours either.
+    regions.sort(key=lambda r: -(max(r[2] - r[0], r[3] - r[1])))
+
+    side_max = float(min(img_w, img_h))
+    groups: List[np.ndarray] = []
+    for region in regions:
+        for i, group in enumerate(groups):
+            union = np.array([
+                min(group[0], region[0]), min(group[1], region[1]),
+                max(group[2], region[2]), max(group[3], region[3]),
+            ], dtype=np.float32)
+            if max(union[2] - union[0], union[3] - union[1]) <= imgsz:
+                groups[i] = union
+                break
+        else:
+            groups.append(region)
+
+    if max_regions > 0 and len(groups) > max_regions:
+        # Keep the largest groups: they hold the most animals, and a tiny
+        # isolated one loses the least by staying at full-frame resolution.
+        groups.sort(key=lambda g: -((g[2] - g[0]) * (g[3] - g[1])))
+        groups = groups[:max_regions]
+
+    windows: List[Tuple[int, int, int, int]] = []
+    for group in groups:
+        needed = max(group[2] - group[0], group[3] - group[1])
+        side = int(round(min(max(float(imgsz), needed), side_max)))
+        cx = (group[0] + group[2]) / 2.0
+        cy = (group[1] + group[3]) / 2.0
+        x0 = int(round(max(0.0, min(cx - side / 2.0, float(img_w - side)))))
+        y0 = int(round(max(0.0, min(cy - side / 2.0, float(img_h - side)))))
+        windows.append((x0, y0, side, side))
+
+    # Two groups can still resolve to the same window once expanded to imgsz.
+    return sorted(set(windows))
+
+
+def _touches_region_edge(
+    box: np.ndarray, window: Tuple[int, int, int, int],
+    img_w: int, img_h: int, margin: int = REGION_EDGE_MARGIN,
+) -> bool:
+    """Whether a detection is clipped by a crop border that is not the image's."""
+    x0, y0, cw, ch = window
+    x1, y1, x2, y2 = (float(v) for v in box)
+    if x1 <= x0 + margin and x0 > 0:
+        return True
+    if y1 <= y0 + margin and y0 > 0:
+        return True
+    if x2 >= x0 + cw - margin and x0 + cw < img_w:
+        return True
+    if y2 >= y0 + ch - margin and y0 + ch < img_h:
+        return True
+    return False
+
+
+def two_stage_detect(
+    frame_bgr: np.ndarray,
+    predict_frame,
+    predict_region,
+    imgsz: int,
+    nms_threshold: float = 0.6,
+    padding: int = REGION_PADDING,
+    max_regions: int = 8,
+    keep_conf: float = 0.0,
+    translate=None,
+) -> Tuple[List["OBBOX"], dict]:
+    """Detect twice: propose regions on the frame, then refine at native scale.
+
+    Two separate predictors, each ``(image) -> List[OBBOX]``, are injected: this
+    module stays free of any ultralytics import, both workers share the exact
+    same procedure, and — the reason they are two rather than one — the passes do
+    not run with the same settings. ``predict_frame`` should be deliberately
+    permissive (confidence around 0.1, as TRex does): it only has to notice that
+    something is there, and its boxes are proposals rather than results.
+    ``predict_region`` uses the real confidence threshold.
+
+    ``translate(box, dx, dy)`` moves an annotation from crop space to frame
+    space; it must move keypoints as well as the polygon.
+
+    Second-pass detections replace the proposals, except where the second pass
+    found nothing: a proposal no refined detection covers is kept rather than
+    silently dropped, so the two-stage path can only ever add detections.
+
+    ``keep_conf`` is the confidence those surviving proposals must reach — pass
+    the *user's* threshold, not ``region_conf``. Without it, a 0.10-confidence
+    proposal would be handed on as a real detection: hidden by the display
+    threshold, but still exported and still fed to the tracker, where it spawns
+    a phantom track. Filtering here makes the two-stage output a strict superset
+    of what a single pass at the same threshold would have produced.
+
+    ``translate`` defaults to :func:`translate_annotation`.
+
+    Returns ``(annotations, stats)``.
+    """
+    if translate is None:
+        translate = translate_annotation
+    stats = {"regions": 0, "pass1": 0, "pass2": 0, "kept_pass1": 0,
+             "below_conf": 0, "edge_dropped": 0, "suppressed": 0}
+    if frame_bgr is None or frame_bgr.size == 0:
+        return [], stats
+
+    img_h, img_w = frame_bgr.shape[:2]
+
+    first = predict_frame(frame_bgr) or []
+    stats["pass1"] = len(first)
+    if not first:
+        return [], stats
+
+    windows = region_windows(
+        [_aabb(b.poly) for b in first], img_w, img_h, imgsz,
+        padding=padding, max_regions=max_regions,
+    )
+    stats["regions"] = len(windows)
+    if not windows:
+        survivors = [p for p in first if float(p.conf) >= keep_conf]
+        stats["below_conf"] = len(first) - len(survivors)
+        stats["kept_pass1"] = len(survivors)
+        return survivors, stats
+
+    refined: List["OBBOX"] = []
+    for (x0, y0, cw, ch) in windows:
+        crop = np.ascontiguousarray(frame_bgr[y0:y0 + ch, x0:x0 + cw])
+        if crop.size == 0:
+            continue
+        for box in predict_region(crop) or []:
+            moved = translate(box, x0, y0)
+            if _touches_region_edge(_aabb(moved.poly), (x0, y0, cw, ch),
+                                    img_w, img_h):
+                stats["edge_dropped"] += 1
+                continue
+            refined.append(moved)
+    stats["pass2"] = len(refined)
+
+    # Proposals the refinement missed entirely are kept, so enabling the
+    # two-stage path can never lose an animal the single pass would have found.
+    survivors = [p for p in first if float(p.conf) >= keep_conf]
+    stats["below_conf"] = len(first) - len(survivors)
+    leftovers = []
+    if refined:
+        refined_aabbs = [_aabb(r.poly) for r in refined]
+        for proposal in survivors:
+            pa = _aabb(proposal.poly)
+            if not any(_pair_iou(pa, ra) >= REGION_COVERED_IOU
+                       for ra in refined_aabbs):
+                leftovers.append(proposal)
+    else:
+        leftovers = list(survivors)
+    stats["kept_pass1"] = len(leftovers)
+
+    combined, removed = suppress_duplicate_detections(
+        refined + leftovers, nms_threshold
+    )
+    stats["suppressed"] = removed
+    return combined, stats
 
 
 # ---------------------------------------------------------------------------

@@ -5,9 +5,14 @@ then track IDs are mapped back onto the original OBBs. Trajectories are read
 from the tracker's internal STrack ``history_observations``.
 
 Exports:
-* ``per_frame/frame_XXXXXX.txt`` — one line per detection
 * ``per_track/track_XXXX.json``  — full history per track ID
+* ``individuals/<name>.json``    — per animal, track fragments merged
 * ``cmc_transforms.json``        — per-frame camera-motion-compensation matrix
+
+On a ``pose`` project every detection additionally carries a ``keypoints``
+mapping (``{name: [x, y]}``, ``null`` on frames where the tracker coasted).
+BoxMOT itself only ever sees the bounding box; the landmarks ride along on the
+same annotation object, so tracking is unaffected by their presence.
 """
 
 import json
@@ -32,10 +37,13 @@ from .individuals import (
 )
 from .individuals_panel import IndividualsPanel, ask_rename
 from .tracking_workers import TrackingStepWorker, VideoExportWorker
-from ..tasks import normalize_task
+from ..tasks import (
+    TASK_POSE, default_keypoint_names, normalize_task,
+)
 from ..utils import (
     OBBOX, FrameSource, VideoSource, ImageFolderSource,
     ensure_bgr_u8,
+    keypoints_to_named_dict,
 )
 
 
@@ -139,7 +147,7 @@ class TrackingPage(QtWidgets.QWidget):
 
         self.export_data_btn = QtWidgets.QPushButton("Export Data 📊")
         self.export_data_btn.setToolTip(
-            "Export per_frame/*.txt + per_track/*.json (no images)"
+            "Export per_track/*.json + individuals/*.json (no images)"
         )
         self.export_data_btn.setFixedHeight(36)
         self.export_data_btn.setEnabled(False)
@@ -160,11 +168,10 @@ class TrackingPage(QtWidgets.QWidget):
         self.id_spin.setValue(-1)
         self.id_spin.setEnabled(False)
 
-        self.conf_spin = QtWidgets.QDoubleSpinBox()
-        self.conf_spin.setRange(0.01, 0.99)
-        self.conf_spin.setSingleStep(0.05)
-        self.conf_spin.setValue(0.5)
-        self.conf_spin.setPrefix("conf=")
+        # No confidence control here: the detection threshold belongs to the
+        # project settings. A second, page-local value would silently diverge
+        # from the one the annotation page and the exports use, and a track
+        # cache built at one threshold cannot be compared with another.
 
         self.frame_skip_spin = QtWidgets.QSpinBox()
         self.frame_skip_spin.setPrefix("Track every ")
@@ -186,7 +193,7 @@ class TrackingPage(QtWidgets.QWidget):
 
         self.only_assigned_chk = QtWidgets.QCheckBox("Assigned tracks only")
         self.only_assigned_chk.setToolTip(
-            "Leave unassigned fragments out of per_frame/ and per_track/.\n"
+            "Leave unassigned fragments out of per_track/.\n"
             "individuals/ never contains them: they belong to no animal."
         )
 
@@ -227,7 +234,6 @@ class TrackingPage(QtWidgets.QWidget):
         tl = QtWidgets.QVBoxLayout(trk)
         tl.addWidget(self.step_btn)
         tl.addWidget(self.progress_bar)
-        tl.addWidget(self.conf_spin)
         tl.addWidget(self.frame_skip_spin)
         tl.addWidget(self.reset_tracker_btn)
 
@@ -327,6 +333,19 @@ class TrackingPage(QtWidgets.QWidget):
     def _task(self) -> str:
         """Project task; decides the tracker's detection layout."""
         return normalize_task(self._cfg().get("task_type"))
+
+    def _keypoint_names(self) -> List[str]:
+        """Landmark names for export, padded to the configured count.
+
+        Read from the project rather than invented here, so a track file and
+        the annotation labels it came from use the same vocabulary.
+        """
+        cfg = self._cfg()
+        n = int(cfg.get("num_keypoints", 0) or 0)
+        names = [str(x) for x in (cfg.get("keypoint_names") or [])]
+        if len(names) < n:
+            names += default_keypoint_names(n)[len(names):]
+        return names
 
     def _cfg(self) -> dict:
         return self._launcher.project_config() if self._launcher else {}
@@ -886,7 +905,7 @@ class TrackingPage(QtWidgets.QWidget):
             self.play_btn, self.pause_btn,
             self.frame_slider, self.reset_tracker_btn,
             self.edit_btn, self.delete_btn,
-            self.conf_spin, self.frame_skip_spin,
+            self.frame_skip_spin,
         ):
             w.setEnabled(enabled)
         self.id_spin.setEnabled(enabled and self.selected_idx is not None)
@@ -923,8 +942,14 @@ class TrackingPage(QtWidgets.QWidget):
             start_idx=start, end_idx=end,
             tracker=self.tracker,
             model_path=cfg.get("model_path", ""),
-            conf=float(self.conf_spin.value()),
+            # Detection threshold from the project settings, the single source
+            # of truth shared with annotation and export.
+            conf=float(cfg.get("conf_threshold", 0.5)),
             imgsz=int(cfg.get("imgsz", 1024)),
+            input_nms=float(cfg.get("input_nms", 0.7)),
+            two_stage=bool(cfg.get("two_stage", False)),
+            region_conf=float(cfg.get("region_conf", 0.10)),
+            max_regions=int(cfg.get("max_regions", 8)),
             frame_skip=self.frame_skip_spin.value(),
             task=self._task(),
         )
@@ -1080,9 +1105,7 @@ class TrackingPage(QtWidgets.QWidget):
         if not out_dir:
             return
 
-        pf_dir = Path(out_dir) / "per_frame"
         pt_dir = Path(out_dir) / "per_track"
-        pf_dir.mkdir(parents=True, exist_ok=True)
         pt_dir.mkdir(parents=True, exist_ok=True)
 
         # ── CMC affine matrices (one entry per tracked frame) ──
@@ -1099,13 +1122,10 @@ class TrackingPage(QtWidgets.QWidget):
         per_track: Dict[int, list] = defaultdict(list)
         n_frames = 0
         n_detections = 0
+        n_with_kpts = 0
 
-        header = (
-            "# track_id centroid_x centroid_y "
-            "bbox_x1 bbox_y1 bbox_x2 bbox_y2 "
-            "obb_x1 obb_y1 obb_x2 obb_y2 obb_x3 obb_y3 obb_x4 obb_y4 "
-            "confidence class_id\n"
-        )
+        is_pose = self._task() == TASK_POSE
+        kpt_names = self._keypoint_names() if is_pose else []
 
         only_assigned = self.only_assigned_chk.isChecked()
         n_skipped_tracks = 0
@@ -1125,23 +1145,11 @@ class TrackingPage(QtWidgets.QWidget):
             if not active:
                 continue
 
-            lines = [header]
             for b in active:
                 pts = b.poly.reshape(4, 2)
                 cx, cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
                 bx1, by1 = float(pts[:, 0].min()), float(pts[:, 1].min())
                 bx2, by2 = float(pts[:, 0].max()), float(pts[:, 1].max())
-                obb_flat = " ".join(
-                    f"{pts[i, j]:.2f}"
-                    for i in range(4) for j in range(2)
-                )
-                lines.append(
-                    f"{b.track_id} "
-                    f"{cx:.2f} {cy:.2f} "
-                    f"{bx1:.2f} {by1:.2f} {bx2:.2f} {by2:.2f} "
-                    f"{obb_flat} "
-                    f"{b.conf:.4f} {b.cls_id}\n"
-                )
 
                 obb_xywhr = obb_to_xywhr(b.poly)
                 frame_cmc = self.cmc_cache.get(frame_idx)
@@ -1149,7 +1157,7 @@ class TrackingPage(QtWidgets.QWidget):
                     frame_cmc.tolist() if frame_cmc is not None else None
                 )
 
-                per_track[b.track_id].append({
+                record = {
                     "frame": frame_idx,
                     "centroid": [round(cx, 2), round(cy, 2)],
                     "bbox": [round(bx1, 2), round(by1, 2),
@@ -1169,10 +1177,17 @@ class TrackingPage(QtWidgets.QWidget):
                     "cmc_affine": cmc_entry,
                     "confidence": round(b.conf, 4),
                     "class_id":   b.cls_id,
-                })
+                }
+                if is_pose:
+                    # BoxMOT tracks the box only, so a coasted frame carries no
+                    # landmarks. null says exactly that, and keeps the key
+                    # present on every record so readers need no lookup guard.
+                    named = keypoints_to_named_dict(b.keypoints, kpt_names)
+                    record["keypoints"] = named
+                    if named:
+                        n_with_kpts += 1
+                per_track[b.track_id].append(record)
 
-            txt_path = pf_dir / f"frame_{frame_idx:06d}.txt"
-            txt_path.write_text("".join(lines))
             n_frames += 1
             n_detections += len(active)
 
@@ -1182,8 +1197,15 @@ class TrackingPage(QtWidgets.QWidget):
                 "num_detections": len(detections),
                 "first_frame":    detections[0]["frame"],
                 "last_frame":     detections[-1]["frame"],
-                "detections":     detections,
             }
+            if is_pose:
+                # Declared once per file instead of on every detection: the
+                # order is the model's keypoint order, which is what makes
+                # flip_idx and the skeleton meaningful downstream.
+                record["task"] = TASK_POSE
+                record["keypoint_names"] = list(kpt_names)
+                record["num_keypoints"] = len(kpt_names)
+            record["detections"] = detections
             json_path = pt_dir / f"track_{tid:04d}.json"
             json_path.write_text(
                 json.dumps(record, indent=2, ensure_ascii=False)
@@ -1212,20 +1234,26 @@ class TrackingPage(QtWidgets.QWidget):
 
         n_tracks = len(per_track)
         n_cmc = sum(1 for v in self.cmc_cache.values() if v is not None)
+        kpt_note = f", {n_with_kpts} with keypoints" if is_pose else ""
         self._status(
             f"Exported {n_detections} detections across {n_frames} frames, "
             f"{n_tracks} tracks, {len(written)} individuals, "
-            f"{n_cmc} CMC matrices → {out_dir}"
+            f"{n_cmc} CMC matrices{kpt_note} → {out_dir}"
         )
 
         lines = [
             f"Exported to: {out_dir}",
             "",
-            f"per_frame/  → {n_frames} files",
             f"per_track/  → {n_tracks} JSON files",
             f"cmc_transforms.json → {n_cmc} matrices",
-            f"Total detections: {n_detections}",
+            f"Total detections: {n_detections} across {n_frames} frames",
         ]
+        if is_pose:
+            without = n_detections - n_with_kpts
+            lines.append(
+                f"Keypoints: {n_with_kpts} detection(s) with landmarks"
+                + (f", {without} without (keypoints: null)" if without else "")
+            )
         if written:
             lines += [
                 "",

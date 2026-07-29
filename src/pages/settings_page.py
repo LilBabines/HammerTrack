@@ -3,8 +3,9 @@
 The launcher only sees ``SettingsPage``. Internally the page wraps a
 ``QTabWidget`` containing one panel per concern:
 
-    Project   — model, dataset, classes, task type
-    Training  — epochs, image size, batch, val split
+    Project   — model, dataset, annotations, classes, task type
+    Training  — epochs, image size, batch, val split, augmentation
+    Inference — detection threshold, two-stage detection
     Tracking  — tracker type, ReID, thresholds
 
 Each sub-panel exposes the same minimal interface:
@@ -56,10 +57,12 @@ class SettingsPage(QtWidgets.QWidget):
 
         self.project_panel   = ProjectSettingsPanel(self)
         self.training_panel  = TrainingSettingsPanel(self)
+        self.inference_panel = InferenceSettingsPanel(self)
         self.tracking_panel  = TrackingSettingsPanel(self)
 
         self.tabs.addTab(self.project_panel,   "Project")
         self.tabs.addTab(self.training_panel,  "Training")
+        self.tabs.addTab(self.inference_panel, "Inference")
         self.tabs.addTab(self.tracking_panel,  "Tracking")
 
         self.save_btn = QtWidgets.QPushButton("Save settings")
@@ -80,6 +83,7 @@ class SettingsPage(QtWidgets.QWidget):
         return [
             self.project_panel,
             self.training_panel,
+            self.inference_panel,
             self.tracking_panel,
         ]
 
@@ -100,12 +104,13 @@ class SettingsPage(QtWidgets.QWidget):
 
     def _on_save(self):
         self.config_changed.emit()
- 
+
+
 class TrainingSettingsPanel(QtWidgets.QWidget):
     """Panel for training hyperparameters and dataset-export options.
- 
+
     Three groups:
- 
+
     * **Training** — ``epochs``, ``imgsz``, ``batch``, ``device``, ``patience``
     * **Validation split** — ``val_split``, ``val_type``
     * **Dataset export** — how annotated frames are turned into a training
@@ -114,12 +119,12 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
       matter for small animals filmed straight down from a drone. Deliberately
       not exhaustive: ``mixup``, ``shear``, ``copy_paste`` and friends either
       do not apply to pose or hurt on small objects.
- 
+
     Note: ``imgsz`` is also used at inference time — there is intentionally a
     single value shared by both. It additionally sets the *floor* for crop
     size on export, so that a crop is never interpolated back up.
     """
- 
+
     #: (stored value, label shown to the user) for the validation strategy.
     VAL_TYPES = (
         ("end", "Temporal — last block"),
@@ -127,32 +132,32 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
         ("start", "Temporal — first block"),
         ("random", "Random per frame (leaky)"),
     )
- 
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._build_ui()
- 
+
     # ==================== UI ====================
- 
+
     def _build_ui(self):
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(20, 20, 20, 20)
         outer.setSpacing(16)
- 
+
         outer.addWidget(self._build_training_group())
         outer.addWidget(self._build_validation_group())
         outer.addWidget(self._build_export_group())
         outer.addWidget(self._build_augmentation_group())
         outer.addStretch(1)
- 
+
     def _build_training_group(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("Training")
         form = QtWidgets.QFormLayout(box)
         form.setSpacing(10)
- 
+
         self.epochs_spin = QtWidgets.QSpinBox()
         self.epochs_spin.setRange(1, 500)
- 
+
         self.imgsz_spin = QtWidgets.QSpinBox()
         self.imgsz_spin.setRange(128, 4096)
         self.imgsz_spin.setSingleStep(64)
@@ -161,21 +166,21 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "minimum crop size on export so crops are never upscaled.\n"
             "Must be a multiple of 32; memory scales with the square."
         )
- 
+
         self.batch_spin = QtWidgets.QSpinBox()
         self.batch_spin.setRange(-1, 128)
         self.batch_spin.setSpecialValueText("auto (-1)")
         self.batch_spin.setToolTip(
             "-1 lets ultralytics pick a batch size targeting ~60% of VRAM."
         )
- 
+
         self.device_edit = QtWidgets.QLineEdit()
         self.device_edit.setPlaceholderText("empty = auto")
         self.device_edit.setToolTip(
             "Passed straight to ultralytics: '0', '0,1', 'cpu', 'mps'.\n"
             "Leave empty to let it choose."
         )
- 
+
         self.patience_spin = QtWidgets.QSpinBox()
         self.patience_spin.setRange(0, 500)
         self.patience_spin.setSpecialValueText("off (0)")
@@ -183,14 +188,14 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "Early stopping: epochs without improvement before aborting.\n"
             "Only meaningful once epochs is large."
         )
- 
+
         self.workers_spin = QtWidgets.QSpinBox()
         self.workers_spin.setRange(0, 32)
         self.workers_spin.setToolTip(
             "Dataloader worker processes. 0 on Windows if you hit spawn "
             "issues."
         )
- 
+
         form.addRow("Epochs:", self.epochs_spin)
         form.addRow("Image size:", self.imgsz_spin)
         form.addRow("Batch size:", self.batch_spin)
@@ -198,19 +203,19 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
         form.addRow("Patience:", self.patience_spin)
         form.addRow("Dataloader workers:", self.workers_spin)
         return box
- 
+
     def _build_validation_group(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("Validation split")
         form = QtWidgets.QFormLayout(box)
         form.setSpacing(10)
- 
+
         self.val_split_spin = QtWidgets.QDoubleSpinBox()
         self.val_split_spin.setRange(0.0, 0.5)
         self.val_split_spin.setSingleStep(0.05)
         self.val_split_spin.setToolTip(
             "Fraction of annotated frames held out for validation."
         )
- 
+
         self.val_type_combo = QtWidgets.QComboBox()
         for value, label in self.VAL_TYPES:
             self.val_type_combo.addItem(label, value)
@@ -223,25 +228,25 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "Use 'middle' if the end of your footage is atypical (return\n"
             "leg, different sun angle)."
         )
- 
+
         self.val_warning = QtWidgets.QLabel()
         self.val_warning.setWordWrap(True)
         self.val_warning.setStyleSheet("color:#c46a00;")
         self.val_type_combo.currentIndexChanged.connect(
             self._update_val_warning
         )
- 
+
         form.addRow("Val split:", self.val_split_spin)
         form.addRow("Val type:", self.val_type_combo)
         form.addRow("", self.val_warning)
         self._update_val_warning()
         return box
- 
+
     def _build_export_group(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("Dataset export")
         form = QtWidgets.QFormLayout(box)
         form.setSpacing(10)
- 
+
         self.multiscale_check = QtWidgets.QCheckBox(
             "Write zoomed crops alongside the full frame"
         )
@@ -250,7 +255,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "centred loosely on the instances, at native resolution."
         )
         self.multiscale_check.toggled.connect(self._update_export_enabled)
- 
+
         self.zoom_levels_spin = QtWidgets.QSpinBox()
         self.zoom_levels_spin.setRange(0, 5)
         self.zoom_levels_spin.setToolTip(
@@ -260,7 +265,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "Levels that would not fit at the requested separation are\n"
             "dropped automatically, so asking for 5 may yield 2."
         )
- 
+
         self.group_margin_spin = QtWidgets.QDoubleSpinBox()
         self.group_margin_spin.setRange(0.0, 1.0)
         self.group_margin_spin.setSingleStep(0.05)
@@ -270,7 +275,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "as a fraction of the group size. Larger means more context and\n"
             "fewer usable crops."
         )
- 
+
         self.scale_step_spin = QtWidgets.QDoubleSpinBox()
         self.scale_step_spin.setRange(1.05, 3.0)
         self.scale_step_spin.setSingleStep(0.1)
@@ -280,7 +285,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "Below this they are near-duplicates that only cost disk and\n"
             "epoch time."
         )
- 
+
         self.edge_pad_spin = QtWidgets.QSpinBox()
         self.edge_pad_spin.setRange(0, 64)
         self.edge_pad_spin.setSuffix(" px")
@@ -288,7 +293,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "Minimum distance kept between any annotation and the crop "
             "border."
         )
- 
+
         self.jpeg_quality_spin = QtWidgets.QSpinBox()
         self.jpeg_quality_spin.setRange(70, 100)
         self.jpeg_quality_spin.setToolTip(
@@ -296,7 +301,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "Block artefacts are visible on keypoints a few pixels wide;\n"
             "100 is near-lossless at roughly double the size."
         )
- 
+
         form.addRow(self.multiscale_check)
         form.addRow("Zoom levels:", self.zoom_levels_spin)
         form.addRow("Group margin:", self.group_margin_spin)
@@ -304,12 +309,12 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
         form.addRow("Edge padding:", self.edge_pad_spin)
         form.addRow("JPEG quality:", self.jpeg_quality_spin)
         return box
- 
+
     def _build_augmentation_group(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("Augmentation")
         form = QtWidgets.QFormLayout(box)
         form.setSpacing(10)
- 
+
         self.degrees_spin = QtWidgets.QDoubleSpinBox()
         self.degrees_spin.setRange(0.0, 180.0)
         self.degrees_spin.setSingleStep(15.0)
@@ -320,7 +325,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "free signal here. Rotation preserves left/right, so keypoints\n"
             "need no index remapping — unlike flips."
         )
- 
+
         self.scale_spin = QtWidgets.QDoubleSpinBox()
         self.scale_spin.setRange(0.0, 0.9)
         self.scale_spin.setSingleStep(0.05)
@@ -330,7 +335,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "1.5x. The ultralytics default of 0.5 halves an already small\n"
             "animal half the time; keep it low when the subject is tiny."
         )
- 
+
         self.translate_spin = QtWidgets.QDoubleSpinBox()
         self.translate_spin.setRange(0.0, 0.9)
         self.translate_spin.setSingleStep(0.05)
@@ -338,17 +343,17 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
         self.translate_spin.setToolTip(
             "Random shift, as a fraction of image size."
         )
- 
+
         self.fliplr_spin = QtWidgets.QDoubleSpinBox()
         self.fliplr_spin.setRange(0.0, 1.0)
         self.fliplr_spin.setSingleStep(0.1)
         self.fliplr_spin.setDecimals(2)
- 
+
         self.flipud_spin = QtWidgets.QDoubleSpinBox()
         self.flipud_spin.setRange(0.0, 1.0)
         self.flipud_spin.setSingleStep(0.1)
         self.flipud_spin.setDecimals(2)
- 
+
         flip_tip = (
             "Probability of a mirror flip. Any mirror swaps left and right,\n"
             "so on a pose task ultralytics remaps the keypoints through\n"
@@ -358,7 +363,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
         )
         self.fliplr_spin.setToolTip(flip_tip)
         self.flipud_spin.setToolTip(flip_tip)
- 
+
         self.mosaic_spin = QtWidgets.QDoubleSpinBox()
         self.mosaic_spin.setRange(0.0, 1.0)
         self.mosaic_spin.setSingleStep(0.1)
@@ -368,7 +373,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "small datasets, but it crops aggressively and compounds with\n"
             "'scale' to shrink small subjects further."
         )
- 
+
         self.close_mosaic_spin = QtWidgets.QSpinBox()
         self.close_mosaic_spin.setRange(0, 100)
         self.close_mosaic_spin.setSpecialValueText("never (0)")
@@ -376,7 +381,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "Disable mosaic for the last N epochs so the model finishes on\n"
             "undistorted images. With few epochs this can cover half the run."
         )
- 
+
         self.hsv_v_spin = QtWidgets.QDoubleSpinBox()
         self.hsv_v_spin.setRange(0.0, 1.0)
         self.hsv_v_spin.setSingleStep(0.05)
@@ -385,7 +390,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "Brightness jitter. Worth keeping high for aerial water: sun\n"
             "angle, glare and depth change exposure a lot between flights."
         )
- 
+
         self.hsv_s_spin = QtWidgets.QDoubleSpinBox()
         self.hsv_s_spin.setRange(0.0, 1.0)
         self.hsv_s_spin.setSingleStep(0.05)
@@ -393,7 +398,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
         self.hsv_s_spin.setToolTip(
             "Saturation jitter — covers turbidity and water colour changes."
         )
- 
+
         self.hsv_h_spin = QtWidgets.QDoubleSpinBox()
         self.hsv_h_spin.setRange(0.0, 0.2)
         self.hsv_h_spin.setSingleStep(0.005)
@@ -402,7 +407,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             "Hue jitter. Keep small: water hue is fairly consistent and\n"
             "shifting it far makes the images unrepresentative."
         )
- 
+
         form.addRow("Rotation:", self.degrees_spin)
         form.addRow("Scale gain:", self.scale_spin)
         form.addRow("Translate:", self.translate_spin)
@@ -414,9 +419,9 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
         form.addRow("HSV saturation:", self.hsv_s_spin)
         form.addRow("HSV hue:", self.hsv_h_spin)
         return box
- 
+
     # ==================== Reactions ====================
- 
+
     def _update_val_warning(self):
         leaky = self.val_type_combo.currentData() == "random"
         self.val_warning.setText(
@@ -425,14 +430,14 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             if leaky else ""
         )
         self.val_warning.setVisible(leaky)
- 
+
     def _update_export_enabled(self, on: bool):
         for widget in (self.zoom_levels_spin, self.group_margin_spin,
                        self.scale_step_spin, self.edge_pad_spin):
             widget.setEnabled(on)
- 
+
     # ==================== Config ====================
- 
+
     def load_config(self, cfg: dict):
         self.epochs_spin.setValue(cfg.get("epochs", 20))
         self.imgsz_spin.setValue(cfg.get("imgsz", 1024))
@@ -440,13 +445,13 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
         self.device_edit.setText(str(cfg.get("device", "")))
         self.patience_spin.setValue(cfg.get("patience", 0))
         self.workers_spin.setValue(cfg.get("workers", 8))
- 
+
         self.val_split_spin.setValue(cfg.get("val_split", 0.1))
         wanted = str(cfg.get("val_type", "end"))
         index = self.val_type_combo.findData(wanted)
         self.val_type_combo.setCurrentIndex(index if index >= 0 else 0)
         self._update_val_warning()
- 
+
         multiscale = bool(cfg.get("multiscale_export", True))
         self.multiscale_check.setChecked(multiscale)
         self.zoom_levels_spin.setValue(cfg.get("crop_zoom_levels", 2))
@@ -455,7 +460,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
         self.edge_pad_spin.setValue(int(cfg.get("crop_edge_pad", 6)))
         self.jpeg_quality_spin.setValue(cfg.get("export_jpeg_quality", 98))
         self._update_export_enabled(multiscale)
- 
+
         # Defaults come from tasks.DEFAULT_TRAIN_OVERRIDES, the same dict the
         # training page falls back on, so what this panel shows is always what
         # a run would actually use.
@@ -469,7 +474,7 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
             ("hsv_h", self.hsv_h_spin),
         ):
             widget.setValue(cfg.get(key, d[key]))
- 
+
     def to_config(self, cfg: dict):
         cfg["epochs"] = self.epochs_spin.value()
         cfg["imgsz"] = self.imgsz_spin.value()
@@ -478,17 +483,17 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
         cfg["device"] = self.device_edit.text().strip()
         cfg["patience"] = self.patience_spin.value()
         cfg["workers"] = self.workers_spin.value()
- 
+
         cfg["val_split"] = self.val_split_spin.value()
         cfg["val_type"] = self.val_type_combo.currentData()
- 
+
         cfg["multiscale_export"] = self.multiscale_check.isChecked()
         cfg["crop_zoom_levels"] = self.zoom_levels_spin.value()
         cfg["crop_group_margin"] = self.group_margin_spin.value()
         cfg["crop_min_scale_step"] = self.scale_step_spin.value()
         cfg["crop_edge_pad"] = float(self.edge_pad_spin.value())
         cfg["export_jpeg_quality"] = self.jpeg_quality_spin.value()
- 
+
         cfg["degrees"] = self.degrees_spin.value()
         cfg["scale"] = self.scale_spin.value()
         cfg["translate"] = self.translate_spin.value()
@@ -499,6 +504,124 @@ class TrainingSettingsPanel(QtWidgets.QWidget):
         cfg["hsv_v"] = self.hsv_v_spin.value()
         cfg["hsv_s"] = self.hsv_s_spin.value()
         cfg["hsv_h"] = self.hsv_h_spin.value()
+
+
+class InferenceSettingsPanel(QtWidgets.QWidget):
+    """Panel for detection at inference time, shared by annotation and tracking.
+
+    Owns: ``conf_threshold``, ``two_stage``, ``region_conf``, ``max_regions``.
+
+    ``conf_threshold`` lives here and not on either page because both of them
+    need it and they must agree: a track cache built at one threshold cannot be
+    compared with annotations produced at another. The annotation page still
+    shows a live spinbox to try values out while working — this is the value it
+    starts from, and the one tracking uses.
+
+    ``imgsz`` is deliberately absent: it belongs to Training, and inference has
+    to use the same value the model was trained at.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build_ui()
+
+    # ==================== UI ====================
+
+    def _build_ui(self):
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(20, 20, 20, 20)
+        outer.setSpacing(16)
+        outer.addWidget(self._build_detection_group())
+        outer.addWidget(self._build_two_stage_group())
+        outer.addStretch(1)
+
+    def _build_detection_group(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("Detection")
+        form = QtWidgets.QFormLayout(box)
+        form.setSpacing(10)
+
+        self.conf_spin = QtWidgets.QDoubleSpinBox()
+        self.conf_spin.setRange(0.01, 0.99)
+        self.conf_spin.setSingleStep(0.05)
+        self.conf_spin.setDecimals(2)
+        self.conf_spin.setToolTip(
+            "Confidence below which a detection is discarded.\n"
+            "Used by the annotation page (as its starting value) and by the\n"
+            "tracker, which has no control of its own precisely so the two\n"
+            "cannot drift apart.\n\n"
+            "Lower it while annotating to catch faint animals; raise it before\n"
+            "tracking, since every spurious detection becomes a track."
+        )
+
+        form.addRow("Detection confidence:", self.conf_spin)
+        return box
+
+    def _build_two_stage_group(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("Two-stage detection")
+        form = QtWidgets.QFormLayout(box)
+        form.setSpacing(10)
+
+        self.two_stage_check = QtWidgets.QCheckBox(
+            "Re-detect inside proposed regions"
+        )
+        self.two_stage_check.setToolTip(
+            "Pass 1 proposes regions on the whole frame; pass 2 re-detects\n"
+            "inside each one at native resolution, never upscaled.\n\n"
+            "On 4K footage a 140 px animal reaches the network at 37 px once\n"
+            "the frame is letterboxed — its tail under 3 px. In a region-sized\n"
+            "crop it arrives at 140 px, and at a scale the model was actually\n"
+            "trained on. Costs one forward pass per region.\n\n"
+            "Manual region inference ignores this: you have already framed the\n"
+            "region yourself."
+        )
+        self.two_stage_check.toggled.connect(self._update_enabled)
+
+        self.region_conf_spin = QtWidgets.QDoubleSpinBox()
+        self.region_conf_spin.setRange(0.01, 0.99)
+        self.region_conf_spin.setSingleStep(0.05)
+        self.region_conf_spin.setDecimals(2)
+        self.region_conf_spin.setToolTip(
+            "Confidence for the proposal pass only. Deliberately far below the\n"
+            "detection threshold: this pass just has to notice that something\n"
+            "is there, and its boxes are proposals rather than results.\n\n"
+            "Too low and noise becomes regions, which costs forward passes."
+        )
+
+        self.max_regions_spin = QtWidgets.QSpinBox()
+        self.max_regions_spin.setRange(1, 32)
+        self.max_regions_spin.setToolTip(
+            "Cap on regions per frame; the largest groups are kept.\n"
+            "Regions are grouped so that animals close together share one\n"
+            "crop, so this is usually reached only on scattered subjects."
+        )
+
+        form.addRow(self.two_stage_check)
+        form.addRow("Proposal confidence:", self.region_conf_spin)
+        form.addRow("Max regions / frame:", self.max_regions_spin)
+        return box
+
+    # ==================== Reactions ====================
+
+    def _update_enabled(self, on: bool):
+        self.region_conf_spin.setEnabled(on)
+        self.max_regions_spin.setEnabled(on)
+
+    # ==================== Config ====================
+
+    def load_config(self, cfg: dict):
+        self.conf_spin.setValue(cfg.get("conf_threshold", 0.5))
+
+        two_stage = bool(cfg.get("two_stage", False))
+        self.two_stage_check.setChecked(two_stage)
+        self.region_conf_spin.setValue(cfg.get("region_conf", 0.10))
+        self.max_regions_spin.setValue(int(cfg.get("max_regions", 8)))
+        self._update_enabled(two_stage)
+
+    def to_config(self, cfg: dict):
+        cfg["conf_threshold"] = self.conf_spin.value()
+        cfg["two_stage"] = self.two_stage_check.isChecked()
+        cfg["region_conf"] = self.region_conf_spin.value()
+        cfg["max_regions"] = self.max_regions_spin.value()
 
 
 class TrackingSettingsPanel(QtWidgets.QWidget):
@@ -527,17 +650,6 @@ class TrackingSettingsPanel(QtWidgets.QWidget):
             "botsort"
         ])
 
-        # ReID weights
-        # self.reid_weights_edit = QtWidgets.QLineEdit("osnet_x0_25_msmt17.pt")
-        # reid_browse = QtWidgets.QPushButton("Browse...")
-        # reid_browse.clicked.connect(self._browse_reid)
-        # reid_row = QtWidgets.QHBoxLayout()
-        # reid_row.addWidget(self.reid_weights_edit, stretch=1)
-        # reid_row.addWidget(reid_browse)
-
-        # self.with_reid_chk = QtWidgets.QCheckBox("Enable ReID")
-        # self.with_reid_chk.setChecked(True)
-
         # Threshold spinboxes
         self.track_high_spin   = self._make_unit_spin(0.6)
         self.track_low_spin    = self._make_unit_spin(0.1)
@@ -546,14 +658,30 @@ class TrackingSettingsPanel(QtWidgets.QWidget):
         self.proximity_spin    = self._make_unit_spin(0.5)
         self.appearance_spin   = self._make_unit_spin(0.25)
 
+        # NOT _make_unit_spin: that one starts at 0.01, and 0 is the value that
+        # disables duplicate suppression entirely.
+        self.input_nms_spin = QtWidgets.QDoubleSpinBox()
+        self.input_nms_spin.setRange(0.0, 1.0)
+        self.input_nms_spin.setSingleStep(0.05)
+        self.input_nms_spin.setDecimals(2)
+        self.input_nms_spin.setSpecialValueText("off (0)")
+        self.input_nms_spin.setValue(0.7)
+        self.input_nms_spin.setToolTip(
+            "IoU above which a detection is dropped as a duplicate, BEFORE\n"
+            "the tracker sees it. Lower is more aggressive; 0 disables it.\n\n"
+            "Two boxes on one animal would otherwise each claim their own\n"
+            "track ID, skeleton and trail, and nothing downstream can merge\n"
+            "them once the identities exist.\n\n"
+            "On a pose task, detections whose skeletons coincide are also\n"
+            "suppressed regardless of IoU."
+        )
+
         # Track buffer (frames)
         self.track_buffer_spin = QtWidgets.QSpinBox()
         self.track_buffer_spin.setRange(1, 300)
         self.track_buffer_spin.setValue(30)
 
         form.addRow("Tracker type:",      self.tracker_type_combo)
-        # form.addRow("ReID weights:",      reid_row)
-        # form.addRow("",                   self.with_reid_chk)
         form.addRow("Track high thresh:", self.track_high_spin)
         form.addRow("Track low thresh:",  self.track_low_spin)
         form.addRow("New track thresh:",  self.new_track_spin)
@@ -561,6 +689,7 @@ class TrackingSettingsPanel(QtWidgets.QWidget):
         form.addRow("Match thresh:",      self.match_thresh_spin)
         form.addRow("Proximity thresh:",  self.proximity_spin)
         form.addRow("Appearance thresh:", self.appearance_spin)
+        form.addRow("Input NMS:", self.input_nms_spin)
 
     @staticmethod
     def _make_unit_spin(default: float) -> QtWidgets.QDoubleSpinBox:
@@ -571,26 +700,12 @@ class TrackingSettingsPanel(QtWidgets.QWidget):
         spin.setValue(default)
         return spin
 
-    # ==================== Browse ====================
-
-    # def _browse_reid(self):
-    #     path, _ = QtWidgets.QFileDialog.getOpenFileName(
-    #         self, "Select ReID weights", "",
-    #         "Model files (*.pt *.pth *.onnx);;All files (*)",
-    #     )
-    #     if path:
-    #         self.reid_weights_edit.setText(path)
-
     # ==================== Config ====================
 
     def load_config(self, cfg: dict):
         self.tracker_type_combo.setCurrentText(
             cfg.get("tracker_type", "botsort")
         )
-        # self.reid_weights_edit.setText(
-        #     cfg.get("reid_weights", "osnet_x0_25_msmt17.pt")
-        # )
-        # self.with_reid_chk.setChecked(cfg.get("with_reid", True))
         self.track_high_spin.setValue(cfg.get("track_high_thresh", 0.6))
         self.track_low_spin.setValue(cfg.get("track_low_thresh", 0.1))
         self.new_track_spin.setValue(cfg.get("new_track_thresh", 0.7))
@@ -598,11 +713,10 @@ class TrackingSettingsPanel(QtWidgets.QWidget):
         self.match_thresh_spin.setValue(cfg.get("match_thresh", 0.8))
         self.proximity_spin.setValue(cfg.get("proximity_thresh", 0.5))
         self.appearance_spin.setValue(cfg.get("appearance_thresh", 0.25))
+        self.input_nms_spin.setValue(cfg.get("input_nms", 0.7))
 
     def to_config(self, cfg: dict):
         cfg["tracker_type"]      = self.tracker_type_combo.currentText()
-        # cfg["reid_weights"]      = self.reid_weights_edit.text()
-        # cfg["with_reid"]         = self.with_reid_chk.isChecked()
         cfg["track_high_thresh"] = self.track_high_spin.value()
         cfg["track_low_thresh"]  = self.track_low_spin.value()
         cfg["new_track_thresh"]  = self.new_track_spin.value()
@@ -610,11 +724,14 @@ class TrackingSettingsPanel(QtWidgets.QWidget):
         cfg["match_thresh"]      = self.match_thresh_spin.value()
         cfg["proximity_thresh"]  = self.proximity_spin.value()
         cfg["appearance_thresh"] = self.appearance_spin.value()
+        cfg["input_nms"] = self.input_nms_spin.value()
+
 
 class ProjectSettingsPanel(QtWidgets.QWidget):
     """Panel for project-level settings.
 
-    Owns: ``model_path``, ``dataset_dir``, ``class_names`` and the pose-only
+    Owns: ``model_path``, ``dataset_dir``, ``annotations_dir``,
+    ``class_names`` and the pose-only
     keypoint settings (``num_keypoints``, ``keypoint_names``, ``flip_idx``,
     ``pose_bbox_mode``).
 
@@ -680,6 +797,24 @@ class ProjectSettingsPanel(QtWidgets.QWidget):
         ds_row.addWidget(self.dataset_dir_edit, stretch=1)
         ds_row.addWidget(ds_browse)
 
+        # Annotation archive: the ground truth, full-size and unsplit. The
+        # dataset next to it is a derived training artifact and may be deleted
+        # and rebuilt; this must not be.
+        self.annot_dir_edit = QtWidgets.QLineEdit()
+        self.annot_dir_edit.setPlaceholderText(
+            "empty = <parent of dataset dir>/annotations"
+        )
+        self.annot_dir_edit.setToolTip(
+            "Where full-size annotated frames are archived, flat, with no\n"
+            "train/val split and no crops. This is what a project reloads\n"
+            "from, so it survives deleting and rebuilding the dataset."
+        )
+        annot_browse = QtWidgets.QPushButton("Browse...")
+        annot_browse.clicked.connect(self._browse_annotations)
+        annot_row = QtWidgets.QHBoxLayout()
+        annot_row.addWidget(self.annot_dir_edit, stretch=1)
+        annot_row.addWidget(annot_browse)
+
         # Class names
         self.class_names_edit = QtWidgets.QLineEdit()
         self.class_names_edit.setToolTip(
@@ -694,6 +829,7 @@ class ProjectSettingsPanel(QtWidgets.QWidget):
         form.addRow("Base model:",        self.base_model_combo)
         form.addRow("Inference weights:", model_row)
         form.addRow("Dataset dir:",    ds_row)
+        form.addRow("Annotations dir:", annot_row)
         form.addRow("Class names:",    self.class_names_edit)
         form.addRow("Finetune dir:",   self.finetune_dir_label)
 
@@ -755,6 +891,13 @@ class ProjectSettingsPanel(QtWidgets.QWidget):
         if path:
             self.dataset_dir_edit.setText(path)
 
+    def _browse_annotations(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select annotation archive directory", "",
+        )
+        if path:
+            self.annot_dir_edit.setText(path)
+
     # ==================== Reactions ====================
 
     def _on_num_kpt_changed(self, n: int):
@@ -791,6 +934,7 @@ class ProjectSettingsPanel(QtWidgets.QWidget):
 
         self.model_path_edit.setText(cfg.get("model_path", ""))
         self.dataset_dir_edit.setText(cfg.get("dataset_dir", ""))
+        self.annot_dir_edit.setText(cfg.get("annotations_dir", ""))
 
         names = cfg.get("class_names", ["object"])
         if isinstance(names, list):
@@ -828,6 +972,9 @@ class ProjectSettingsPanel(QtWidgets.QWidget):
         cfg["default_model"] = self.base_model_combo.currentText()
         cfg["model_path"]  = self.model_path_edit.text()
         cfg["dataset_dir"] = self.dataset_dir_edit.text()
+        # Left empty on purpose when unset: AnnotatePage then derives it as a
+        # sibling of the dataset dir, so the two stay together on their own.
+        cfg["annotations_dir"] = self.annot_dir_edit.text().strip()
         cfg["class_names"] = names
         # task_type is intentionally NOT written back: ProjectManager owns it.
 
