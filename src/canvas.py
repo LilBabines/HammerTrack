@@ -154,6 +154,15 @@ class AnnotationCanvas(QtWidgets.QLabel):
 
     # ==================== Coordinate mapping ====================
 
+    def display_scale(self) -> float:
+        """Current image→display scale factor (``base * zoom``).
+
+        Exposed so callers can size interaction tolerances in screen pixels
+        instead of image pixels: a grab radius that is fixed in image space
+        becomes unusable at high zoom on 4K footage.
+        """
+        return float(self._draw_map.get("scale", 1.0) or 1.0)
+
     def display_to_image(self, x_disp: int, y_disp: int):
         """Convert display coords → image coords.
 

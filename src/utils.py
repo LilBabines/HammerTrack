@@ -8,6 +8,8 @@ from PySide6 import QtGui
 import warnings
 import os
 
+from .tasks import TASK_OBB, TASK_POSE, KPT_DIMS, normalize_task
+
 
 def ensure_bgr_u8(img: np.ndarray) -> np.ndarray:
     """Convert an image (8/16-bit, mono/RGBA) to BGR uint8 for display and processing.
@@ -159,6 +161,70 @@ def keypoints_to_bbox_poly(
         y1, y2 = max(0.0, y1), min(float(img_h - 1), y2)
 
     return rect_to_poly_xyxy(x1, y1, x2, y2)
+
+
+def parse_yolo_label_line(
+    line: str,
+    task: str,
+    img_w: int,
+    img_h: int,
+    num_keypoints: int = 0,
+) -> Optional["OBBOX"]:
+    """Rebuild an annotation from one YOLO label line (inverse of the export).
+
+    This is what makes an exported dataset reloadable: the label files are the
+    single source of truth, so nothing can drift between what is on disk and
+    what the GUI shows. Coordinates are denormalized with ``img_w`` / ``img_h``,
+    which must be the dimensions of the image the label was written against.
+
+    * ``detect`` → ``cls cx cy w h``                  → axis-aligned 4-pt poly
+    * ``obb``    → ``cls x1 y1 ... x4 y4``            → exact 4-pt poly
+    * ``pose``   → ``cls cx cy w h x1 y1 ... xN yN``  → poly + (N, 2) keypoints
+
+    Returns ``None`` on a malformed or truncated line rather than raising, so a
+    single bad row cannot stop a whole project from loading. Reloaded
+    annotations are marked ``verified`` with ``conf = 1.0``: they only ever
+    reach a label file after a human accepted them.
+    """
+    task = normalize_task(task)
+    parts = line.split()
+    if len(parts) < 5:
+        return None
+    try:
+        cls_id = int(float(parts[0]))
+        vals = [float(v) for v in parts[1:]]
+    except ValueError:
+        return None
+
+    if task == TASK_OBB:
+        if len(vals) < 8:
+            return None
+        poly = np.asarray(vals[:8], dtype=np.float32).reshape(4, 2)
+        poly[:, 0] *= img_w
+        poly[:, 1] *= img_h
+        return OBBOX(poly=poly, cls_id=cls_id, conf=1.0, verified=True)
+
+    # detect and pose share the leading "cx cy w h"
+    cx, cy, bw, bh = vals[:4]
+    poly = rect_to_poly_xyxy(
+        (cx - bw / 2.0) * img_w, (cy - bh / 2.0) * img_h,
+        (cx + bw / 2.0) * img_w, (cy + bh / 2.0) * img_h,
+    )
+
+    keypoints = None
+    if task == TASK_POSE:
+        flat = vals[4:]
+        n = num_keypoints or (len(flat) // KPT_DIMS)
+        if n <= 0 or len(flat) < n * KPT_DIMS:
+            return None
+        keypoints = np.asarray(
+            flat[:n * KPT_DIMS], dtype=np.float32
+        ).reshape(n, KPT_DIMS)
+        keypoints[:, 0] *= img_w
+        keypoints[:, 1] *= img_h
+
+    return OBBOX(poly=poly, cls_id=cls_id, conf=1.0,
+                 verified=True, keypoints=keypoints)
 
 
 def find_orthogonal_projection(
@@ -313,6 +379,15 @@ class FrameSource:
     def close(self): pass
     def name(self) -> str: return ""
 
+    def frame_size(self, idx: int = 0) -> Optional[tuple]:
+        """``(width, height)`` of a frame, without decoding it if possible.
+
+        Needed to denormalize YOLO labels when reloading an exported dataset.
+        Subclasses answer from metadata; the fallback decodes one frame.
+        """
+        img = self.read(idx)
+        return (int(img.shape[1]), int(img.shape[0])) if img is not None else None
+
 
 class VideoSource(FrameSource):
     """Random-access video reader that stays fast when read sequentially.
@@ -371,6 +446,18 @@ class VideoSource(FrameSource):
         if self.cap: self.cap.release()
     def name(self) -> str: return os.path.basename(self.path)
 
+    def frame_size(self, idx: int = 0) -> Optional[tuple]:
+        """Frame size straight from the container: no decode, no seek.
+
+        Reading it from CAP_PROP also leaves ``self._pos`` untouched, so the
+        sequential-read fast path is not invalidated.
+        """
+        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if w > 0 and h > 0:
+            return (w, h)
+        return super().frame_size(idx)
+
 
 class ImageFolderSource(FrameSource):
     IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -401,3 +488,16 @@ class ImageFolderSource(FrameSource):
     def path_at(self, idx: int) -> str:
         idx = max(0, min(idx, len(self.paths) - 1))
         return self.paths[idx]
+
+    def frame_size(self, idx: int = 0) -> Optional[tuple]:
+        """Size from the image header only — no pixel decoding.
+
+        Unlike a video, a folder may mix resolutions, so this is queried per
+        index rather than once for the whole source.
+        """
+        idx = max(0, min(idx, len(self.paths) - 1))
+        reader = QtGui.QImageReader(self.paths[idx])
+        size = reader.size()
+        if size.isValid() and size.width() > 0 and size.height() > 0:
+            return (int(size.width()), int(size.height()))
+        return super().frame_size(idx)

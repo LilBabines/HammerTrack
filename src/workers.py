@@ -21,6 +21,11 @@ from .tasks import (
 from .utils import OBBOX, rect_to_poly_xyxy
 
 
+_RESERVED_TRAIN_ARGS = frozenset({
+        "data", "epochs", "imgsz", "batch", "project", "name",
+        "exist_ok", "verbose", "seed", "task", "model", "resume",
+    })
+
 def resolve_model_path(model_path: str, task: str = TASK_DETECT) -> str:
     """Return usable inference weights for ``task``.
 
@@ -303,7 +308,7 @@ class DetectFinetuneWorker(QtCore.QObject):
         epochs: int = 20,
         imgsz: int = 1024,
         batch: int = 8,
-        val_split: float = 0.1,
+        overrides: Optional[dict] = None,
         seed: int = 1337,
     ):
         super().__init__()
@@ -316,7 +321,7 @@ class DetectFinetuneWorker(QtCore.QObject):
         self.epochs = int(epochs)
         self.imgsz = int(imgsz)
         self.batch = int(batch)
-        self.val_split = float(val_split)
+        self.overrides = dict(overrides or {})
         self.seed = int(seed)
         self.data_yaml = data_yaml
 
@@ -384,33 +389,30 @@ class DetectFinetuneWorker(QtCore.QObject):
             worker_ref = self  # prevent GC issues in closure
 
             def _on_fit_epoch_end(trainer):
-                """Called by ultralytics at the end of each epoch (after val)."""
                 epoch = trainer.epoch + 1
                 metrics = {}
 
-                # Collect available metrics from the trainer
-                if hasattr(trainer, "metrics") and trainer.metrics:
-                    for k, v in trainer.metrics.items():
-                        try:
-                            metrics[k] = float(v)
-                        except (TypeError, ValueError):
-                            pass
+                for k, v in (getattr(trainer, "metrics", None) or {}).items():
+                    try:
+                        metrics[str(k)] = float(v)
+                    except (TypeError, ValueError):
+                        continue
 
-                # Also grab the last training loss values
-                if (hasattr(trainer, "loss_items")
-                        and trainer.loss_items is not None):
-                    loss_names = getattr(trainer, "loss_names", None)
-                    loss_vals = trainer.loss_items
-                    if hasattr(loss_vals, "cpu"):
-                        loss_vals = loss_vals.cpu().numpy()
-                    if loss_names and len(loss_names) == len(loss_vals):
-                        for name, val in zip(loss_names, loss_vals):
-                            metrics[f"train/{name}"] = float(val)
+                # tloss = moyenne sur l'epoch (loss_items = dernier batch seulement)
+                tloss = getattr(trainer, "tloss", None)
+                if tloss is not None:
+                    try:
+                        items = trainer.label_loss_items(tloss)   # dict {'train/box_loss': float, ...}
+                        if isinstance(items, dict):               # None → renvoie une liste de noms
+                            for k, v in items.items():
+                                try:
+                                    metrics[str(k)] = float(v)
+                                except (TypeError, ValueError):
+                                    continue
+                    except Exception:
+                        pass
 
-                frac = epoch / total_epochs
-                worker_ref.progress.emit(
-                    f"Epoch {epoch}/{total_epochs}", frac
-                )
+                worker_ref.progress.emit(f"Epoch {epoch}/{total_epochs}", epoch / total_epochs)
                 worker_ref.epoch_metrics.emit(epoch, total_epochs, metrics)
 
             model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
@@ -428,6 +430,21 @@ class DetectFinetuneWorker(QtCore.QObject):
             if self.task == TASK_POSE:
                 self._warn_if_flip_idx_missing()
 
+            safe = {k: v for k, v in self.overrides.items()
+                    if k not in _RESERVED_TRAIN_ARGS}
+            dropped = sorted(set(self.overrides) - set(safe))
+            if dropped:
+                self.log_line.emit(
+                    f"WARNING: ignoring reserved train() override(s): "
+                    f"{', '.join(dropped)}"
+                )
+            if safe:
+                self.log_line.emit(
+                    "=== Overrides: "
+                    + ", ".join(f"{k}={v}" for k, v in sorted(safe.items()))
+                    + " ==="
+                )
+
             model.train(
                 data=self.data_yaml,
                 epochs=self.epochs,
@@ -438,8 +455,7 @@ class DetectFinetuneWorker(QtCore.QObject):
                 exist_ok=True,
                 verbose=True,
                 seed=self.seed,
-                flipud=0.5,
-                fliplr=0.5,
+                **safe,          # ← remplace flipud=0.5, fliplr=0.5 en dur
             )
 
             # Locate best weights

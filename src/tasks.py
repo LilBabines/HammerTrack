@@ -61,6 +61,30 @@ POSE_BBOX_MANUAL = "manual"  # drawn by hand before placing the keypoints
 POSE_BBOX_MODES = (POSE_BBOX_AUTO, POSE_BBOX_MANUAL)
 
 
+# Training knobs forwarded to ultralytics ``train()``, with the defaults this
+# tool applies when a project config does not carry them. Kept here, and not
+# in the settings panel, so the panel and the training page cannot disagree:
+# a project saved before these settings existed must still train the way the
+# UI claims it will.
+#
+# These are NOT the ultralytics defaults. ``scale`` is lowered (0.5 rescales
+# an already tiny animal down to half its size half the time) and ``degrees``
+# is raised (footage shot straight down has no privileged heading, and
+# rotation preserves left/right so keypoints need no remapping).
+DEFAULT_TRAIN_OVERRIDES = {
+    "degrees": 180.0,
+    "scale": 0.2,
+    "translate": 0.1,
+    "fliplr": 0.5,
+    "flipud": 0.5,
+    "mosaic": 1.0,
+    "close_mosaic": 10,
+    "hsv_v": 0.4,
+    "hsv_s": 0.7,
+    "hsv_h": 0.015,
+}
+
+
 def normalize_task(task: Optional[str]) -> str:
     """Return a valid task string, falling back to ``obb`` for legacy configs.
 
