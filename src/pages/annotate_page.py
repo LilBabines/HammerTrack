@@ -62,6 +62,7 @@ from ..utils import (
     find_orthogonal_projection, keypoints_to_bbox_poly,
     parse_yolo_label_line, rect_to_poly_xyxy,
     FrameSource, VideoSource, ImageFolderSource,
+    ORIGIN_DATASET, ORIGIN_MANUAL, ORIGIN_MODEL
 )
 from ..workers import (
     DetectionWorker,
@@ -798,7 +799,9 @@ class AnnotatePage(QtWidgets.QWidget):
     def _on_inference_done(self, frame_idx: int, class_names,
                            annots: List[PolyClass]):
         self.class_names = class_names
-        self.pred_cache[frame_idx] = annots
+        kept = [b for b in self.pred_cache.get(frame_idx, [])
+                if b.is_ground_truth() or b.verified]
+        self.pred_cache[frame_idx] = kept + list(annots)
         self.selected_idx = None
         if frame_idx == self.current_idx:
             self.redraw_current()
@@ -969,7 +972,7 @@ class AnnotatePage(QtWidgets.QWidget):
         # dataset by what is actually on disk. A source does not have to be
         # loaded: an already-exported dataset is trainable on its own.
         n_new = 0
-        if self.src_path and self.dataset:
+        if self.src_path and (any(self.dataset.values()) or self._dirty_frames):
             cfg_pre = self._launcher.project_config() if self._launcher else {}
             n_new = self._export_verified_to_dataset(
                 val_split=cfg_pre.get("val_split", 0.1),
@@ -1192,28 +1195,22 @@ class AnnotatePage(QtWidgets.QWidget):
     _EXPORT_STEM_RE = re.compile(r"^(?P<src>.+)_frame(?P<idx>\d{6})$")
 
     def _dataset_label_files(self) -> Dict[int, Path]:
-        """Map ``frame_idx`` → label file for the currently loaded source.
-
-        The annotation archive is read first: it is the ground truth, it is
-        flat, and it is unaffected by the split being recomputed. The dataset
-        splits are only scanned as a fallback, for projects created before the
-        archive existed — and never for frames the archive already covers, so
-        a stale dataset copy can never win over the archive.
-        """
         found: Dict[int, Path] = {}
         if self.source is None:
             return found
-        src_stem = Path(self.source.name()).stem
+        prefix = f"{self.source.stem()}_"
 
         def collect(lbl_dir: Path, into: Dict[int, Path]):
             if not lbl_dir.is_dir():
                 return
             for path in lbl_dir.glob("*.txt"):
-                match = self._EXPORT_STEM_RE.match(path.stem)
-                if not match or match.group("src") != src_stem:
+                if not path.stem.startswith(prefix):
                     continue
-                idx = int(match.group("idx"))
-                if 0 <= idx < max(1, self.total_frames):
+                # The source resolves its own convention. A multi-scale crop
+                # ("..._z2") resolves to nothing and is skipped, which is what
+                # we want: its coordinates live in crop space.
+                idx = self.source.index_for_key(path.stem[len(prefix):])
+                if idx is not None and 0 <= idx < max(1, self.total_frames):
                     into.setdefault(idx, path)
 
         if self.annot_dir:
@@ -1483,12 +1480,24 @@ class AnnotatePage(QtWidgets.QWidget):
         (root / "labels").mkdir(parents=True, exist_ok=True)
 
         written = 0
+        removed = 0
         for frame_idx, boxes in self.dataset.items():
-            if not boxes:
-                continue
             stem = self._frame_stem(frame_idx)
             img_path = root / "images" / f"{stem}.jpg"
             lbl_path = root / "labels" / f"{stem}.txt"
+
+            live = [b for b in boxes if not b.deleted]
+
+            if not live:
+                # Emptying a frame IS an edit. Skipping it here would leave
+                # the previous archive in place, and since the archive is what
+                # load_annotations_from_dataset() reads back, the deleted
+                # annotations would silently reappear on the next open.
+                if img_path.exists() or lbl_path.exists():
+                    img_path.unlink(missing_ok=True)
+                    lbl_path.unlink(missing_ok=True)
+                    removed += 1
+                continue
 
             if (img_path.exists() and lbl_path.exists()
                     and frame_idx not in self._dirty_frames):
@@ -1500,11 +1509,16 @@ class AnnotatePage(QtWidgets.QWidget):
             h, w = img.shape[:2]
 
             lines = [ln for ln in
-                     (self._poly_to_yolo_line(b, w, h)
-                      for b in boxes if not b.deleted) if ln]
+                     (self._poly_to_yolo_line(b, w, h) for b in live) if ln]
             if not lines:
-                # No valid annotation for this task: archiving the image with
-                # an empty label would record a false negative.
+                # Every annotation is invalid for this task (e.g. a pose with
+                # the wrong keypoint count). Archiving the image with an empty
+                # label would record a false negative — and a previously valid
+                # archive must not survive either.
+                if img_path.exists() or lbl_path.exists():
+                    img_path.unlink(missing_ok=True)
+                    lbl_path.unlink(missing_ok=True)
+                    removed += 1
                 continue
 
             cv2.imwrite(str(img_path), img,
@@ -1513,7 +1527,7 @@ class AnnotatePage(QtWidgets.QWidget):
             lbl_path.write_text("\n".join(lines) + "\n")
             written += 1
 
-        return written
+        return written, removed
 
     #: Optional ultralytics ``train()`` knobs stored in the project config.
     #: Anything absent is simply not forwarded, so it keeps the ultralytics
@@ -1551,9 +1565,15 @@ class AnnotatePage(QtWidgets.QWidget):
         return overrides
 
     def _frame_stem(self, frame_idx: int) -> str:
-        """On-disk base name of a frame's full view."""
-        src_name = self.source.name() if self.source else "src"
-        return f"{Path(src_name).stem}_frame{frame_idx:06d}"
+        """On-disk base name of a frame's full view.
+
+        The naming convention belongs to the source: an index for a video,
+        the image file name for a folder — the only key that survives the
+        folder gaining or losing a file.
+        """
+        if self.source is None:
+            return f"src_frame{frame_idx:06d}"
+        return f"{self.source.stem()}_{self.source.frame_key(frame_idx)}"
 
     @staticmethod
     def _temporal_val_frames(frames: List[int], val_split: float,
@@ -1630,10 +1650,10 @@ class AnnotatePage(QtWidgets.QWidget):
 
         # Ground truth first: whatever happens to the dataset below, the
         # full-size annotated frames are safely archived.
-        archived = self._export_full_frames_to_annotations()
-        if archived:
-            self._status(f"Archived {archived} full-size frame(s) to "
-                         f"{self.annot_dir}")
+        archived, unarchived = self._export_full_frames_to_annotations()
+        if archived or unarchived:
+            self._status(f"Archive: {archived} frame(s) written, "
+                         f"{unarchived} removed → {self.annot_dir}")
 
         # --- Split, decided once for the whole source ---
         annotated = sorted(idx for idx, bx in self.dataset.items() if bx)
@@ -1672,10 +1692,18 @@ class AnnotatePage(QtWidgets.QWidget):
                          f"split.")
 
         exported = 0
+        purged = 0
         for frame_idx, boxes in self.dataset.items():
             if not boxes:
                 continue
             base_stem = self._frame_stem(frame_idx)
+
+            if self._purge_frame_views(ds, base_stem) is not None:
+                purged += 1
+                existing_stems -= {
+                    st for st in existing_stems
+                    if st == base_stem or st.startswith(f"{base_stem}_z")
+                }
             # What is already on disk, view by view. A single "already
             # exported" flag is not enough: a dataset written before
             # multi-scale existed has the full view but no crops, and those
@@ -1776,6 +1804,10 @@ class AnnotatePage(QtWidgets.QWidget):
 
             existing_stems.add(base_stem)
 
+        if purged:
+            self._status(f"Removed {purged} frame(s) whose annotations were "
+                         f"all deleted.")
+            
         # Everything pending has been written; the next export skips these
         # frames again unless they are edited anew.
         self._dirty_frames.clear()
@@ -1814,10 +1846,11 @@ class AnnotatePage(QtWidgets.QWidget):
                 self.window(), "Export", "Load a source first."
             )
             return
-        if not self.dataset:
+        if not any(self.dataset.values()) and not self._dirty_frames:
             QtWidgets.QMessageBox.warning(
                 self.window(), "Export",
-                "No verified annotations to export.",
+                "Nothing to export: no annotation, and nothing deleted "
+                "since the last export.",
             )
             return
 
@@ -2187,10 +2220,29 @@ class AnnotatePage(QtWidgets.QWidget):
         box = boxes[self.selected_idx]
         if box.deleted:
             return
+        if box.is_ground_truth():
+            self._status("Manual annotation: already in the dataset "
+                         "(Del to remove it).")
+            self.selected_idx = None
+            self.redraw_current()
+            return
+
+        # A pose box with no keypoints is rejected by _poly_to_yolo_line.
+        # Accepting it would put it in self.dataset, mark the frame annotated
+        # in the UI, and then drop it silently at export time.
+        if (not box.verified
+                and self._effective_task() == TASK_POSE
+                and not box.has_keypoints()):
+            self._status("Cannot accept: pose instance without keypoints. "
+                         "Place them by hand first.")
+            return
+
         box.verified = not box.verified
         self.update_dataset_for_frame(self.current_idx)
-        state = "verified" if box.verified else "unverified"
-        self._status(f"Box #{self.selected_idx} → {state}")
+        self._status(
+            f"Detection #{self.selected_idx} "
+            f"{'added to' if box.verified else 'removed from'} the dataset."
+        )
         self.selected_idx = None
         self.redraw_current()
 
@@ -2207,6 +2259,14 @@ class AnnotatePage(QtWidgets.QWidget):
         self.redraw_current()
 
     def update_dataset_for_frame(self, frame_idx: int):
+
+        sel = self.selected_idx
+        if sel is not None and sel < len(all_boxes):
+            b = all_boxes[sel]
+            if not b.deleted and b.origin == ORIGIN_MODEL:
+                b.verified = True
+                b.origin = ORIGIN_MANUAL
+
         all_boxes = self.pred_cache.get(frame_idx, [])
         self.dataset[frame_idx] = [
             b for b in all_boxes if b.verified and not b.deleted
@@ -2450,6 +2510,7 @@ class AnnotatePage(QtWidgets.QWidget):
 
         new_box = OBBOX(
             poly=poly, cls_id=0, conf=1.0, verified=False, keypoints=kpts,
+            origin=ORIGIN_MANUAL
         )
         self.pred_cache.setdefault(self.current_idx, []).append(new_box)
         self.selected_idx = len(self.pred_cache[self.current_idx]) - 1
@@ -2469,7 +2530,7 @@ class AnnotatePage(QtWidgets.QWidget):
             pts = np.concatenate(
                 (self.temp_poly_pts, primes), axis=0, dtype=np.float32,
             )
-            new_box = OBBOX(poly=pts, cls_id=0, conf=1.0, verified=False)
+            new_box = OBBOX(poly=pts, cls_id=0, conf=1.0, verified=False, origin=ORIGIN_MANUAL)
             self.pred_cache.setdefault(self.current_idx, []).append(new_box)
             self.selected_idx = len(self.pred_cache[self.current_idx]) - 1
             self.temp_poly_pts.clear()
