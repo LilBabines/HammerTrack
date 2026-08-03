@@ -8,8 +8,15 @@ from PySide6 import QtGui
 import copy
 import warnings
 import os
+import re
+from pathlib import Path
 
 from .tasks import TASK_OBB, TASK_POSE, KPT_DIMS, normalize_task
+
+
+ORIGIN_MANUAL = "manual"      # drawn by hand in this session
+ORIGIN_DATASET = "dataset"    # reloaded from an exported label file
+ORIGIN_MODEL = "model"        # produced by inference
 
 
 def ensure_bgr_u8(img: np.ndarray) -> np.ndarray:
@@ -67,10 +74,15 @@ class PolyClass:
     verified: bool = False
     deleted: bool = False
     keypoints: Optional[np.ndarray] = None    # shape (N, 2) float32, image coords
+    origin: str = ORIGIN_MODEL
 
     def has_keypoints(self) -> bool:
         return self.keypoints is not None and len(self.keypoints) > 0
-
+    
+    def is_ground_truth(self) -> bool:
+        """True for annotations that belong in the dataset unconditionally."""
+        return self.origin in (ORIGIN_MANUAL, ORIGIN_DATASET)
+    
     def to_json(self) -> dict:
         return {
             "poly": self.poly.tolist(),
@@ -80,6 +92,7 @@ class PolyClass:
             "deleted": bool(self.deleted),
             "keypoints": (self.keypoints.tolist()
                           if self.has_keypoints() else None),
+            "origin": self.origin,
         }
 
 
@@ -203,7 +216,7 @@ def parse_yolo_label_line(
         poly = np.asarray(vals[:8], dtype=np.float32).reshape(4, 2)
         poly[:, 0] *= img_w
         poly[:, 1] *= img_h
-        return OBBOX(poly=poly, cls_id=cls_id, conf=1.0, verified=True)
+        return OBBOX(poly=poly, cls_id=cls_id, conf=1.0, verified=True, origin=ORIGIN_DATASET)
 
     # detect and pose share the leading "cx cy w h"
     cx, cy, bw, bh = vals[:4]
@@ -225,7 +238,7 @@ def parse_yolo_label_line(
         keypoints[:, 1] *= img_h
 
     return OBBOX(poly=poly, cls_id=cls_id, conf=1.0,
-                 verified=True, keypoints=keypoints)
+                 verified=True, keypoints=keypoints, origin=ORIGIN_DATASET)
 
 
 def parse_pose_result(res) -> List["OBBOX"]:
@@ -811,6 +824,20 @@ class FrameSource:
     def close(self): pass
     def name(self) -> str: return ""
 
+    def stem(self) -> str:
+        """Source identifier used as a PREFIX in export file names."""
+        return Path(self.name()).stem
+
+    def frame_key(self, idx: int) -> str:
+        """Per-frame identifier used as a SUFFIX in export file names."""
+        return f"frame{idx:06d}"
+
+    def index_for_key(self, key: str) -> Optional[int]:
+        """Inverse of frame_key(), or None if key is not one of ours."""
+        m = re.fullmatch(r"frame(\d{6})", key)
+        return int(m.group(1)) if m else None
+    
+
     def frame_size(self, idx: int = 0) -> Optional[tuple]:
         """``(width, height)`` of a frame, without decoding it if possible.
 
@@ -893,22 +920,54 @@ class VideoSource(FrameSource):
 
 class ImageFolderSource(FrameSource):
     IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+    _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
     def __init__(self, folder: str):
-        self.path = folder
+        self.path = os.path.abspath(folder)          # see C.1
         files = [f for f in os.listdir(self.path)
                  if os.path.splitext(f)[1].lower() in self.IMAGE_EXTS]
         if not files:
             raise RuntimeError("No images found in folder.")
-        import re
+
         def _key(s):
             return [int(t) if t.isdigit() else t.lower()
                     for t in re.findall(r'\d+|\D+', s)]
         files.sort(key=_key)
         self.paths = [os.path.join(self.path, f) for f in files]
 
+        # Export key = image FILE NAME, not position. Inserting or deleting
+        # one image shifts every index after it; keys built from the position
+        # would then re-attach every label to the wrong image, silently.
+        keys, seen = [], set()
+        for p in self.paths:
+            k = self._SAFE.sub("_", Path(p).stem)
+            if k in seen:
+                # photo.jpg and photo.png share a stem: fold the extension in
+                # or the second one overwrites the first one's label.
+                k = self._SAFE.sub("_", os.path.basename(p))
+            seen.add(k)
+            keys.append(k)
+        self._keys = keys
+        self._key_index = {k: i for i, k in enumerate(keys)}
+
+    def stem(self) -> str:
+        # A folder has no extension: Path().stem would cut "prise_2024.01.15"
+        # down to "prise_2024.01", and two dated folders would collide.
+        return self._SAFE.sub("_", self.name()) or "images"
+    
     def count(self) -> int: return len(self.paths)
 
+    def frame_key(self, idx: int) -> str:
+        return self._keys[max(0, min(idx, len(self._keys) - 1))]
+
+    def index_for_key(self, key: str) -> Optional[int]:
+        idx = self._key_index.get(key)
+        if idx is not None:
+            return idx
+        # Fallback for datasets exported back when folders were named by
+        # position, so an existing project is not orphaned.
+        return super().index_for_key(key)
+    
     def read(self, idx: int) -> Optional[np.ndarray]:
         idx = max(0, min(idx, len(self.paths) - 1))
         img = cv2.imread(self.paths[idx], cv2.IMREAD_UNCHANGED)
